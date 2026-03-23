@@ -25,3 +25,6 @@ lead_gen/
 listing_audit/
 sqp_demo/
 ronny_zuvo_amz_ads/
+
+# Streamlit local secrets
+.streamlit/secrets.toml
