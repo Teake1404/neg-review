@@ -1,0 +1,27 @@
+# Credentials and sensitive files
+*_credentials.md
+*_credentials.txt
+*.env
+.env.local
+.env.*.local
+
+# API keys and secrets
+*_api_keys*
+*_secrets*
+
+# Personal/client data
+client_credentials/
+credentials/
+
+# Keep repo minimal for review app deploy
+*.md
+*.pdf
+*.html
+
+# Project folders to exclude
+ads_mcp/
+amazon_scraper/
+lead_gen/
+listing_audit/
+sqp_demo/
+ronny_zuvo_amz_ads/
