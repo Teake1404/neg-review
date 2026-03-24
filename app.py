@@ -16,7 +16,7 @@ import requests
 import streamlit as st
 
 EU_API = "https://advertising-api-eu.amazon.com"
-MIN_SPEND = 200          # ₹
+MIN_SPEND = 50           # ₹ — lower for weekly window (30-day spend ÷ ~4)
 MAX_ACOS = 0.30
 CACHE_TTL = 60 * 60 * 24 * 7   # 7 days
 
