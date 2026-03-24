@@ -16,10 +16,17 @@ import requests
 import streamlit as st
 
 EU_API = "https://advertising-api-eu.amazon.com"
-MIN_SPEND = 200          # ₹ — lowered so borderline terms show up
+MIN_SPEND = 200          # ₹
 MAX_ACOS = 0.30
-LOOKBACK_DAYS = 30
-CACHE_TTL = 60 * 60 * 24 * 7   # 7 days — refresh once per week
+CACHE_TTL = 60 * 60 * 24 * 7   # 7 days
+
+
+def last_week_range():
+    """Returns (start, end) for last Mon–Sun, always fully processed."""
+    today = datetime.today().date()
+    last_sunday = today - timedelta(days=today.weekday() + 1)
+    last_monday = last_sunday - timedelta(days=6)
+    return last_monday, last_sunday
 
 
 def get_profile_map() -> Dict[str, str]:
@@ -67,7 +74,7 @@ def fetch_flagged_terms_cached(
     profile_label: str,
     min_spend: int,
     max_acos: float,
-    lookback_days: int,
+    _unused: int = 0,
 ) -> Tuple[List[Dict], int, str]:
     """
     Returns (flagged_terms, total_raw_rows, error_message).
@@ -75,8 +82,7 @@ def fetch_flagged_terms_cached(
     """
     token = _get_token(client_id, client_secret, refresh_token)
 
-    end_date = datetime.today() - timedelta(days=1)
-    start_date = end_date - timedelta(days=lookback_days)
+    start_date, end_date = last_week_range()
 
     headers = {
         "Amazon-Advertising-API-ClientId": client_id,
@@ -191,7 +197,7 @@ def load_all_terms(force: bool = False) -> pd.DataFrame:
         progress.progress((i / total), text=f"Fetching {label} — this takes ~2 min...")
         flagged, raw_rows, err = fetch_flagged_terms_cached(
             client_id, client_secret, refresh_token,
-            pid, label, MIN_SPEND, MAX_ACOS, LOOKBACK_DAYS,
+            pid, label, MIN_SPEND, MAX_ACOS, 0,
         )
         if err:
             debug_lines.append(f"⚠️ {label}: {err}")
@@ -265,8 +271,7 @@ def main() -> None:
     with col_a:
         refresh_clicked = st.button("🔄 Refresh Data", help="Force re-fetch from Amazon API (clears weekly cache)")
     with col_b:
-        end = datetime.today() - timedelta(days=1)
-        start = end - timedelta(days=LOOKBACK_DAYS)
+        start, end = last_week_range()
         st.markdown(f"**Date Range:** `{start.strftime('%Y-%m-%d')}` to `{end.strftime('%Y-%m-%d')}`")
 
     if "terms_df" not in st.session_state or refresh_clicked:
@@ -293,11 +298,11 @@ def main() -> None:
 
     st.markdown("### Filters")
     f1, f2, f3 = st.columns(3)
-    if f1.button("All", use_container_width=True):
+    if f1.button("All", width="stretch"):
         st.session_state["active_filter"] = "All"
-    if f2.button("Zero Orders", use_container_width=True):
+    if f2.button("Zero Orders", width="stretch"):
         st.session_state["active_filter"] = "Zero Orders"
-    if f3.button("High ACoS", use_container_width=True):
+    if f3.button("High ACoS", width="stretch"):
         st.session_state["active_filter"] = "High ACoS"
 
     active_filter = st.session_state.get("active_filter", "All")
@@ -320,7 +325,7 @@ def main() -> None:
         edited = st.data_editor(
             view_df[editable_cols],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             disabled=["searchTerm", "campaignName", "adGroupName", "spend", "orders", "acosPct", "reason", "accountLabel"],
             column_config={
                 "selected": st.column_config.CheckboxColumn("✓ Negate?"),
