@@ -156,6 +156,7 @@ def fetch_flagged_terms_cached(
                         "campaignName": row.get("campaignName", ""),
                         "adGroupId": str(row.get("adGroupId", "")),
                         "adGroupName": row.get("adGroupName", ""),
+                        "clicks": int(row.get("clicks", 0) or 0),
                         "spend": round(spend, 2),
                         "sales": round(sales, 2),
                         "orders": orders,
@@ -320,15 +321,16 @@ def main() -> None:
     else:
         editable_cols = [
             "selected", "searchTerm", "campaignName", "adGroupName",
-            "spend", "orders", "acosPct", "reason", "accountLabel",
+            "clicks", "spend", "orders", "acosPct", "reason", "accountLabel",
         ]
         edited = st.data_editor(
             view_df[editable_cols],
             hide_index=True,
             width="stretch",
-            disabled=["searchTerm", "campaignName", "adGroupName", "spend", "orders", "acosPct", "reason", "accountLabel"],
+            disabled=["searchTerm", "campaignName", "adGroupName", "clicks", "spend", "orders", "acosPct", "reason", "accountLabel"],
             column_config={
                 "selected": st.column_config.CheckboxColumn("✓ Negate?"),
+                "clicks": st.column_config.NumberColumn("Clicks", format="%d"),
                 "spend": st.column_config.NumberColumn("Spend (₹)", format="%.0f"),
                 "acosPct": st.column_config.NumberColumn("ACoS %", format="%.0f%%"),
             },
