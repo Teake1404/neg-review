@@ -352,22 +352,13 @@ def main() -> None:
     start, end = date_range_30d()
 
     # ── Top controls ──────────────────────────────────────────────────────────
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1.5])
+    c1, c2 = st.columns([1.2, 1.5])
     with c1:
         acos_pct = st.number_input(
             "ACoS Threshold %", min_value=1, max_value=500, value=30, step=5,
             help="Negatives: terms above this % flagged as waste. Winners: terms below this %.",
         )
     with c2:
-        min_spend_ui = st.number_input("Min Spend ₹", min_value=1, max_value=5000, value=50, step=10)
-    with c3:
-        min_clicks = st.number_input(
-            "Min Clicks (Winners)", min_value=1, max_value=200, value=3, step=1,
-            help="Minimum clicks needed to qualify as a scaling candidate",
-        )
-    with c4:
-        min_orders = st.number_input("Min Orders (Winners)", min_value=1, max_value=100, value=1, step=1)
-    with c5:
         st.write("")
         col_r, col_d = st.columns(2)
         with col_r:
@@ -392,7 +383,7 @@ def main() -> None:
     kw_by_profile: Dict[str, List]   = st.session_state.get("kw_by_profile", {})
 
     if st.session_state.get("debug_lines"):
-        with st.expander("🔍 API Debug", expanded=False):
+        with st.expander("API Debug Info", expanded=False):
             for line in st.session_state["debug_lines"]:
                 st.write(line)
 
@@ -400,15 +391,17 @@ def main() -> None:
         st.warning("No data. Check credentials or click Refresh.")
         st.stop()
 
-    # ── Filter by UI controls ─────────────────────────────────────────────────
-    df_f = df[df["spend"] >= min_spend_ui].copy()
+    # ── Single-threshold logic ────────────────────────────────────────────────
+    # One ACoS input controls both negatives and winners.
+    # Spend gate remains MIN_SPEND (₹50) from backend fetch.
+    df_f = df.copy()
 
     neg_mask = (df_f["orders"] == 0) | (
         df_f["acosPct"].notna() & (df_f["acosPct"] > acos_pct)
     )
     win_mask = (
-        (df_f["orders"] >= min_orders) &
-        (df_f["clicks"] >= min_clicks) &
+        (df_f["orders"] > 0) &
+        (df_f["clicks"] >= 3) &
         (df_f["acosPct"].notna()) &
         (df_f["acosPct"] <= acos_pct)
     )
@@ -435,26 +428,15 @@ def main() -> None:
         k2.metric("Wasted Spend",    f"₹{neg_df['spend'].sum():,.0f}")
         k3.metric("ACoS Threshold",  f"{acos_pct}%")
 
-        # Sub-filter buttons
-        st.markdown("**Filter:**")
-        b1, b2, b3 = st.columns(3)
-        if b1.button("All",         key="nf_all"):  st.session_state["neg_f"] = "All"
-        if b2.button("Zero Orders", key="nf_zero"): st.session_state["neg_f"] = "Zero Orders"
-        if b3.button("High ACoS",   key="nf_high"): st.session_state["neg_f"] = "High ACoS"
-        nf = st.session_state.get("neg_f", "All")
-
-        view = (
-            neg_df[neg_df["orders"] == 0].copy() if nf == "Zero Orders" else
-            neg_df[neg_df["orders"] > 0].copy()  if nf == "High ACoS"   else
-            neg_df.copy()
-        )
+        # No separate filter buttons per requirement; one threshold drives all logic.
+        view = neg_df.copy()
 
         # Add selected column
         if "neg_selected" not in st.session_state:
             st.session_state["neg_selected"] = {row["id"]: True for _, row in neg_df.iterrows()}
         view["selected"] = view["id"].map(lambda x: st.session_state["neg_selected"].get(x, True))
 
-        st.markdown(f"**{len(view)} terms** · {nf}")
+        st.markdown(f"**{len(view)} terms flagged by threshold**")
 
         if not view.empty:
             cols = ["selected", "searchTerm", "campaignName", "adGroupName",
