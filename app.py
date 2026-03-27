@@ -1,8 +1,8 @@
 """
-Streamlit Negative Keyword Review App
-
-Run locally:
-    streamlit run app.py
+Menhood Ads — Negative Review + Winners Scale App
+Two tabs:
+  1. 🚫 Negative Review  — flag wasteful terms, apply negatives
+  2. 🚀 Scale Winners    — find converting terms, check keyword coverage, create exact keywords
 """
 
 from datetime import datetime, timedelta
@@ -15,99 +15,80 @@ import pandas as pd
 import requests
 import streamlit as st
 
-EU_API = "https://advertising-api-eu.amazon.com"
-MIN_SPEND = 50           # ₹ — lower for weekly window (30-day spend ÷ ~4)
-MAX_ACOS = 0.30
-CACHE_TTL = 60 * 60 * 24 * 7   # 7 days
+EU_API       = "https://advertising-api-eu.amazon.com"
+MIN_SPEND    = 50       # ₹ — minimum spend to surface a term
+CACHE_TTL    = 60 * 60 * 6   # 6 hours
 
 
-def last_week_range():
-    """Returns (start, end) for last Mon–Sun, always fully processed."""
-    today = datetime.today().date()
-    last_sunday = today - timedelta(days=today.weekday() + 1)
-    last_monday = last_sunday - timedelta(days=6)
-    return last_monday, last_sunday
+# ─── Date range ──────────────────────────────────────────────────────────────
 
+def date_range_30d() -> Tuple:
+    today     = datetime.today().date()
+    end_date  = today - timedelta(days=3)       # 3-day Amazon data lag
+    start_date = end_date - timedelta(days=29)
+    return start_date, end_date
+
+
+# ─── Credentials / profiles ──────────────────────────────────────────────────
 
 def get_profile_map() -> Dict[str, str]:
     if "MENHOOD_PROFILES" in st.secrets:
-        profiles = st.secrets["MENHOOD_PROFILES"]
-        return {str(k): str(v) for k, v in profiles.items()}
+        return {str(k): str(v) for k, v in st.secrets["MENHOOD_PROFILES"].items()}
     p1 = str(st.secrets.get("MENHOOD_PROFILE_1", "")).strip()
     p2 = str(st.secrets.get("MENHOOD_PROFILE_2", "")).strip()
-    profile_map: Dict[str, str] = {}
-    if p1:
-        profile_map[p1] = "Menhood - Postpaid"
-    if p2:
-        profile_map[p2] = "Menhood - Prepaid"
-    return profile_map
+    out: Dict[str, str] = {}
+    if p1: out[p1] = "Menhood - Postpaid"
+    if p2: out[p2] = "Menhood - Prepaid"
+    return out
 
 
 def _get_token(client_id: str, client_secret: str, refresh_token: str) -> str:
     r = requests.post(
         "https://api.amazon.com/auth/o2/token",
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
+        data={"grant_type": "refresh_token", "refresh_token": refresh_token,
+              "client_id": client_id, "client_secret": client_secret},
         timeout=30,
     )
     if r.status_code >= 400:
-        try:
-            err = r.json()
-        except Exception:
-            err = {"raw": r.text}
-        raise RuntimeError(
-            f"Token request failed ({r.status_code}). Amazon: {err}"
-        )
+        raise RuntimeError(f"Token failed ({r.status_code}): {r.text[:200]}")
     return r.json()["access_token"]
 
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_flagged_terms_cached(
-    client_id: str,
-    client_secret: str,
-    refresh_token: str,
-    profile_id: str,
-    profile_label: str,
-    min_spend: int,
-    max_acos: float,
-    _unused: int = 0,
-) -> Tuple[List[Dict], int, str]:
-    """
-    Returns (flagged_terms, total_raw_rows, error_message).
-    Cached for CACHE_TTL so repeat visits are instant.
-    """
-    token = _get_token(client_id, client_secret, refresh_token)
+# ─── Fetch: search term report ────────────────────────────────────────────────
 
-    start_date, end_date = last_week_range()
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_report_data_cached(
+    client_id: str, client_secret: str, refresh_token: str,
+    profile_id: str, profile_label: str,
+    _bust: int = 0,
+) -> Tuple[List[Dict], int, str]:
+    """Returns (all_terms_above_MIN_SPEND, total_raw_rows, error_msg)."""
+    token = _get_token(client_id, client_secret, refresh_token)
+    start_date, end_date = date_range_30d()
 
     headers = {
         "Amazon-Advertising-API-ClientId": client_id,
-        "Amazon-Advertising-API-Scope": profile_id,
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
+        "Amazon-Advertising-API-Scope":    profile_id,
+        "Authorization":                   f"Bearer {token}",
+        "Content-Type":                    "application/json",
     }
 
     body = {
-        "name": f"NegKW {profile_label} {end_date.strftime('%Y-%m-%d')}",
-        "startDate": start_date.strftime("%Y-%m-%d"),
-        "endDate": end_date.strftime("%Y-%m-%d"),
+        "name": f"NegKW {profile_label} {end_date}",
+        "startDate": str(start_date),
+        "endDate":   str(end_date),
         "configuration": {
-            "adProduct": "SPONSORED_PRODUCTS",
-            "groupBy": ["searchTerm"],
+            "adProduct":    "SPONSORED_PRODUCTS",
+            "groupBy":      ["searchTerm"],
             "columns": [
                 "campaignId", "campaignName",
-                "adGroupId", "adGroupName",
-                "searchTerm",
-                "impressions", "clicks",
-                "cost", "purchases7d", "sales7d",
+                "adGroupId",  "adGroupName",
+                "searchTerm", "impressions", "clicks",
+                "cost", "purchases30d", "sales30d",
             ],
             "reportTypeId": "spSearchTerm",
-            "timeUnit": "SUMMARY",
-            "format": "GZIP_JSON",
+            "timeUnit":     "SUMMARY",
+            "format":       "GZIP_JSON",
         },
     }
 
@@ -117,250 +98,547 @@ def fetch_flagged_terms_cached(
 
     report_id = rr.json().get("reportId")
     if not report_id:
-        return [], 0, f"No reportId in response: {rr.text[:300]}"
+        return [], 0, f"No reportId: {rr.text[:200]}"
 
-    # Poll up to 30× with 10s gap = 5 min max
-    for attempt in range(30):
+    for _ in range(30):
         time.sleep(10)
         rs = requests.get(f"{EU_API}/reporting/reports/{report_id}", headers=headers, timeout=30)
         if rs.status_code >= 400:
             return [], 0, f"Poll failed {rs.status_code}: {rs.text[:200]}"
-
         status = rs.json()
-        state = status.get("status", "UNKNOWN")
+        state  = status.get("status", "UNKNOWN")
 
         if state == "COMPLETED":
             url = status.get("url") or status.get("location")
             if not url:
-                return [], 0, f"COMPLETED but no download URL. Full response: {status}"
-            raw = requests.get(url, timeout=60)
+                return [], 0, f"COMPLETED but no URL: {status}"
+            raw  = requests.get(url, timeout=60)
             raw.raise_for_status()
             data = json.loads(gzip.decompress(raw.content))
-            total_rows = len(data)
+            total = len(data)
 
-            flagged = []
+            rows = []
             for row in data:
-                spend = float(row.get("cost", 0) or 0)
-                sales = float(row.get("sales7d", 0) or 0)
-                orders = int(row.get("purchases7d", 0) or 0)
-                acos = spend / sales if sales > 0 else None
-
-                if spend >= min_spend and (
-                    orders == 0 or (acos is not None and acos > max_acos)
-                ):
-                    flagged.append({
-                        "selected": True,
-                        "id": f"{row.get('campaignId')}_{row.get('adGroupId')}_{row.get('searchTerm', '')}",
-                        "searchTerm": row.get("searchTerm", ""),
-                        "campaignId": str(row.get("campaignId", "")),
-                        "campaignName": row.get("campaignName", ""),
-                        "adGroupId": str(row.get("adGroupId", "")),
-                        "adGroupName": row.get("adGroupName", ""),
-                        "clicks": int(row.get("clicks", 0) or 0),
-                        "spend": round(spend, 2),
-                        "sales": round(sales, 2),
-                        "orders": orders,
-                        "acosPct": round(acos * 100, 2) if acos is not None else None,
-                        "reason": "Zero Orders" if orders == 0 else "High ACoS",
-                        "profile": profile_id,
-                        "accountLabel": profile_label,
-                    })
-
-            flagged.sort(key=lambda x: x["spend"], reverse=True)
-            return flagged, total_rows, ""
+                spend  = float(row.get("cost", 0) or 0)
+                if spend < MIN_SPEND:
+                    continue
+                sales  = float(row.get("sales30d",    0) or 0)
+                orders = int(row.get("purchases30d", 0) or 0)
+                clicks = int(row.get("clicks",       0) or 0)
+                acos   = spend / sales if sales > 0 else None
+                rows.append({
+                    "id":           f"{row.get('campaignId')}_{row.get('adGroupId')}_{row.get('searchTerm','')}",
+                    "searchTerm":   row.get("searchTerm", ""),
+                    "campaignId":   str(row.get("campaignId", "")),
+                    "campaignName": row.get("campaignName", ""),
+                    "adGroupId":    str(row.get("adGroupId", "")),
+                    "adGroupName":  row.get("adGroupName", ""),
+                    "clicks":  clicks,
+                    "spend":   round(spend, 2),
+                    "sales":   round(sales,  2),
+                    "orders":  orders,
+                    "acosPct": round(acos * 100, 2) if acos is not None else None,
+                    "profile":      profile_id,
+                    "accountLabel": profile_label,
+                })
+            rows.sort(key=lambda x: x["spend"], reverse=True)
+            return rows, total, ""
 
         if state == "FAILED":
-            failure_reason = status.get("failureReason", "no reason given")
-            return [], 0, f"Report FAILED for {profile_label}: {failure_reason}"
+            return [], 0, f"Report FAILED ({profile_label}): {status.get('failureReason','')}"
 
-    return [], 0, f"Report timed out after 5 min for {profile_label} (reportId={report_id})"
+    return [], 0, f"Timed out ({profile_id})"
 
 
-def load_all_terms(force: bool = False) -> pd.DataFrame:
+# ─── Fetch: existing SP keywords ─────────────────────────────────────────────
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_keywords_cached(
+    client_id: str, client_secret: str, refresh_token: str,
+    profile_id: str,
+    _bust: int = 0,
+) -> Tuple[List[Dict], str]:
+    """Returns (keywords_list, error). Fetches all enabled+paused SP keywords."""
+    try:
+        token = _get_token(client_id, client_secret, refresh_token)
+    except Exception as e:
+        return [], str(e)
+
+    headers = {
+        "Amazon-Advertising-API-ClientId": client_id,
+        "Amazon-Advertising-API-Scope":    profile_id,
+        "Authorization":                   f"Bearer {token}",
+        "Content-Type":                    "application/vnd.spKeyword.v3+json",
+        "Accept":                          "application/vnd.spKeyword.v3+json",
+    }
+
+    keywords, start_index = [], 0
+    while True:
+        r = requests.post(
+            f"{EU_API}/sp/keywords/list",
+            headers=headers,
+            json={"maxResults": 1000, "startIndex": start_index,
+                  "stateFilter": "ENABLED,PAUSED"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            return keywords, f"Keywords fetch {r.status_code}: {r.text[:200]}"
+        batch = r.json().get("keywords", [])
+        keywords.extend(batch)
+        if len(batch) < 1000:
+            break
+        start_index += 1000
+
+    return keywords, ""
+
+
+# ─── Load everything ──────────────────────────────────────────────────────────
+
+def load_all_data(force: bool = False):
+    """Returns (terms_df, kw_by_profile, debug_lines)."""
     profile_map = get_profile_map()
     if not profile_map:
-        raise RuntimeError("No profile IDs found in secrets.")
+        raise RuntimeError("No profile IDs in secrets.")
 
-    client_id     = st.secrets["AMAZON_CLIENT_ID"]
-    client_secret = st.secrets["AMAZON_CLIENT_SECRET"]
-    refresh_token = st.secrets["AMAZON_REFRESH_TOKEN"]
+    cid = st.secrets["AMAZON_CLIENT_ID"]
+    sec = st.secrets["AMAZON_CLIENT_SECRET"]
+    tok = st.secrets["AMAZON_REFRESH_TOKEN"]
 
     if force:
-        fetch_flagged_terms_cached.clear()
+        fetch_report_data_cached.clear()
+        fetch_keywords_cached.clear()
 
-    all_terms: List[Dict] = []
-    debug_lines: List[str] = []
-
-    progress = st.progress(0, text="Starting report generation...")
-    total = len(profile_map)
+    bust = int(force)
+    all_terms:      List[Dict]            = []
+    kw_by_profile:  Dict[str, List[Dict]] = {}
+    debug_lines:    List[str]             = []
+    n = len(profile_map)
+    prog = st.progress(0, text="Starting…")
 
     for i, (pid, label) in enumerate(profile_map.items()):
-        progress.progress((i / total), text=f"Fetching {label} — this takes ~2 min...")
-        flagged, raw_rows, err = fetch_flagged_terms_cached(
-            client_id, client_secret, refresh_token,
-            pid, label, MIN_SPEND, MAX_ACOS, 0,
+        prog.progress(i / (n * 2), text=f"Search terms: {label}…")
+        terms, raw, err = fetch_report_data_cached(cid, sec, tok, pid, label, bust)
+        debug_lines.append(
+            f"⚠️ {label}: {err}" if err
+            else f"✅ {label}: {raw} rows → {len(terms)} above ₹{MIN_SPEND}"
         )
-        if err:
-            debug_lines.append(f"⚠️ {label}: {err}")
-        else:
-            debug_lines.append(f"✅ {label}: {raw_rows} total rows → {len(flagged)} flagged (≥₹{MIN_SPEND} spend, bad performance)")
-        all_terms.extend(flagged)
+        all_terms.extend(terms)
 
-    progress.progress(1.0, text="Done!")
-    time.sleep(0.5)
-    progress.empty()
+        prog.progress((i + 0.5) / n, text=f"Keywords: {label}…")
+        kws, kw_err = fetch_keywords_cached(cid, sec, tok, pid, bust)
+        debug_lines.append(
+            f"⚠️ {label} keywords: {kw_err}" if kw_err
+            else f"✅ {label}: {len(kws)} keywords"
+        )
+        kw_by_profile[pid] = kws
 
-    st.session_state["debug_lines"] = debug_lines
+    prog.progress(1.0, text="Done!")
+    time.sleep(0.3)
+    prog.empty()
 
-    if not all_terms:
-        return pd.DataFrame(columns=[
-            "selected", "searchTerm", "campaignName", "adGroupName",
-            "spend", "orders", "acosPct", "reason", "accountLabel",
-            "campaignId", "adGroupId", "profile", "sales", "id",
-        ])
-
-    return pd.DataFrame(all_terms)
+    df = pd.DataFrame(all_terms) if all_terms else pd.DataFrame()
+    return df, kw_by_profile, debug_lines
 
 
-def apply_negatives(token: str, selected_terms: List[Dict]) -> Dict:
-    client_id = st.secrets["AMAZON_CLIENT_ID"]
-    results = {"success": [], "errors": []}
+# ─── Keyword coverage helpers ─────────────────────────────────────────────────
 
+def build_kw_sets(kw_by_profile: Dict[str, List[Dict]]) -> Dict[str, Dict[str, set]]:
+    """Returns {profile_id: {EXACT: {texts}, PHRASE: {texts}, BROAD: {texts}}}."""
+    out = {}
+    for pid, kws in kw_by_profile.items():
+        sets: Dict[str, set] = {"EXACT": set(), "PHRASE": set(), "BROAD": set()}
+        for kw in kws:
+            mt = kw.get("matchType", "").upper()
+            kt = kw.get("keywordText", "").lower().strip()
+            if mt in sets and kt:
+                sets[mt].add(kt)
+        out[pid] = sets
+    return out
+
+
+def check_coverage(term: str, profile_id: str, kw_sets: Dict) -> Dict[str, bool]:
+    t    = term.lower().strip()
+    sets = kw_sets.get(profile_id, {"EXACT": set(), "PHRASE": set(), "BROAD": set()})
+    # Exact: term == keyword
+    exact  = t in sets["EXACT"]
+    # Phrase: any phrase keyword is a contiguous substring of the search term
+    phrase = any(kw in t for kw in sets["PHRASE"] if kw)
+    # Broad: any word from broad keyword appears in search term
+    t_words = set(t.split())
+    broad  = any(any(w in t_words for w in kw.split()) for kw in sets["BROAD"] if kw)
+    return {"EXACT": exact, "PHRASE": phrase, "BROAD": broad}
+
+
+# ─── Amazon API write operations ──────────────────────────────────────────────
+
+def apply_negatives(token: str, terms: List[Dict]) -> Dict:
+    cid = st.secrets["AMAZON_CLIENT_ID"]
+    results: Dict[str, List] = {"success": [], "errors": []}
     by_profile: Dict[str, List[Dict]] = {}
-    for t in selected_terms:
+    for t in terms:
         by_profile.setdefault(t["profile"], []).append(t)
 
-    for profile_id, terms in by_profile.items():
+    for pid, pts in by_profile.items():
         headers = {
-            "Amazon-Advertising-API-ClientId": client_id,
-            "Amazon-Advertising-API-Scope": profile_id,
-            "Authorization": f"Bearer {token}",
+            "Amazon-Advertising-API-ClientId": cid,
+            "Amazon-Advertising-API-Scope":    pid,
+            "Authorization":                   f"Bearer {token}",
             "Content-Type": "application/vnd.spNegativeKeyword.v3+json",
-            "Accept": "application/vnd.spNegativeKeyword.v3+json",
+            "Accept":       "application/vnd.spNegativeKeyword.v3+json",
         }
         payload = [
-            {
-                "campaignId": t["campaignId"],
-                "adGroupId": t["adGroupId"],
-                "keywordText": t["searchTerm"],
-                "matchType": "NEGATIVE_EXACT",
-                "state": "ENABLED",
-            }
-            for t in terms
+            {"campaignId": t["campaignId"], "adGroupId": t["adGroupId"],
+             "keywordText": t["searchTerm"], "matchType": "NEGATIVE_EXACT", "state": "ENABLED"}
+            for t in pts
         ]
         for i in range(0, len(payload), 1000):
             r = requests.post(
                 f"{EU_API}/sp/negativeKeywords",
                 headers=headers,
-                json={"negativeKeywords": payload[i: i + 1000]},
+                json={"negativeKeywords": payload[i:i+1000]},
                 timeout=30,
             )
             r.raise_for_status()
             rd = r.json()
             results["success"].extend(rd.get("negativeKeywords", {}).get("success", []))
-            results["errors"].extend(rd.get("negativeKeywords", {}).get("error", []))
-
+            results["errors"].extend(rd.get("negativeKeywords", {}).get("error",   []))
     return results
 
 
+def add_exact_keywords(token: str, terms: List[Dict], bid: float) -> Dict:
+    """Add winning search terms as [exact] keywords to their originating ad groups."""
+    cid = st.secrets["AMAZON_CLIENT_ID"]
+    results: Dict[str, List] = {"success": [], "errors": []}
+    by_profile: Dict[str, List[Dict]] = {}
+    for t in terms:
+        by_profile.setdefault(t["profile"], []).append(t)
+
+    for pid, pts in by_profile.items():
+        headers = {
+            "Amazon-Advertising-API-ClientId": cid,
+            "Amazon-Advertising-API-Scope":    pid,
+            "Authorization":                   f"Bearer {token}",
+            "Content-Type": "application/vnd.spKeyword.v3+json",
+            "Accept":       "application/vnd.spKeyword.v3+json",
+        }
+        payload = [
+            {"campaignId": t["campaignId"], "adGroupId": t["adGroupId"],
+             "keywordText": t["searchTerm"], "matchType": "EXACT",
+             "state": "ENABLED", "bid": bid}
+            for t in pts
+        ]
+        for i in range(0, len(payload), 1000):
+            r = requests.post(
+                f"{EU_API}/sp/keywords",
+                headers=headers,
+                json={"keywords": payload[i:i+1000]},
+                timeout=30,
+            )
+            if r.status_code >= 400:
+                results["errors"].append({"msg": f"{r.status_code}: {r.text[:200]}"})
+                continue
+            rd = r.json()
+            results["success"].extend(rd.get("keywords", {}).get("success", []))
+            results["errors"].extend(rd.get("keywords", {}).get("error",   []))
+    return results
+
+
+# ─── Main UI ──────────────────────────────────────────────────────────────────
+
 def main() -> None:
-    st.set_page_config(page_title="Negative Keyword Review", layout="wide")
-    st.title("Negative Keyword Review")
-    st.caption("Rajesh can deselect terms he wants to keep, then click Apply.")
+    st.set_page_config(page_title="Menhood Ads Review", layout="wide", page_icon="🎯")
+    st.title("🎯 Menhood Ads — Keyword Review")
 
-    col_a, col_b = st.columns([1, 3])
-    with col_a:
-        refresh_clicked = st.button("🔄 Refresh Data", help="Force re-fetch from Amazon API (clears weekly cache)")
-    with col_b:
-        start, end = last_week_range()
-        st.markdown(f"**Date Range:** `{start.strftime('%Y-%m-%d')}` to `{end.strftime('%Y-%m-%d')}`")
+    start, end = date_range_30d()
 
-    if "terms_df" not in st.session_state or refresh_clicked:
+    # ── Top controls ──────────────────────────────────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1.5])
+    with c1:
+        acos_pct = st.number_input(
+            "ACoS Threshold %", min_value=1, max_value=500, value=30, step=5,
+            help="Negatives: terms above this % flagged as waste. Winners: terms below this %.",
+        )
+    with c2:
+        min_spend_ui = st.number_input("Min Spend ₹", min_value=1, max_value=5000, value=50, step=10)
+    with c3:
+        min_clicks = st.number_input(
+            "Min Clicks (Winners)", min_value=1, max_value=200, value=3, step=1,
+            help="Minimum clicks needed to qualify as a scaling candidate",
+        )
+    with c4:
+        min_orders = st.number_input("Min Orders (Winners)", min_value=1, max_value=100, value=1, step=1)
+    with c5:
+        st.write("")
+        col_r, col_d = st.columns(2)
+        with col_r:
+            refresh = st.button("🔄 Refresh", help="Force re-fetch from Amazon API")
+        with col_d:
+            st.caption(f"📅 `{start}` → `{end}`")
+
+    # ── Load data ─────────────────────────────────────────────────────────────
+    if "terms_df" not in st.session_state or refresh:
         try:
-            st.session_state["terms_df"] = load_all_terms(force=refresh_clicked)
-            st.session_state["active_filter"] = "All"
+            df, kw_by_profile, debug_lines = load_all_data(force=refresh)
+            st.session_state.update({
+                "terms_df":      df,
+                "kw_by_profile": kw_by_profile,
+                "debug_lines":   debug_lines,
+            })
         except Exception as e:
             st.error(f"Error loading data: {e}")
             st.stop()
 
-    # Debug panel
+    df:           pd.DataFrame       = st.session_state["terms_df"].copy()
+    kw_by_profile: Dict[str, List]   = st.session_state.get("kw_by_profile", {})
+
     if st.session_state.get("debug_lines"):
-        with st.expander("API Debug Info", expanded=False):
+        with st.expander("🔍 API Debug", expanded=False):
             for line in st.session_state["debug_lines"]:
                 st.write(line)
 
-    df = st.session_state["terms_df"].copy()
-    total_waste = float(df["spend"].sum()) if not df.empty else 0.0
+    if df.empty:
+        st.warning("No data. Check credentials or click Refresh.")
+        st.stop()
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Terms Flagged", int(len(df)))
-    k2.metric("Total Wasted Spend", f"₹{total_waste:,.0f}")
-    k3.metric("Threshold", f"≥₹{MIN_SPEND} spend + 0 orders or ACoS>{int(MAX_ACOS*100)}%")
+    # ── Filter by UI controls ─────────────────────────────────────────────────
+    df_f = df[df["spend"] >= min_spend_ui].copy()
 
-    st.markdown("### Filters")
-    f1, f2, f3 = st.columns(3)
-    if f1.button("All", width="stretch"):
-        st.session_state["active_filter"] = "All"
-    if f2.button("Zero Orders", width="stretch"):
-        st.session_state["active_filter"] = "Zero Orders"
-    if f3.button("High ACoS", width="stretch"):
-        st.session_state["active_filter"] = "High ACoS"
+    neg_mask = (df_f["orders"] == 0) | (
+        df_f["acosPct"].notna() & (df_f["acosPct"] > acos_pct)
+    )
+    win_mask = (
+        (df_f["orders"] >= min_orders) &
+        (df_f["clicks"] >= min_clicks) &
+        (df_f["acosPct"].notna()) &
+        (df_f["acosPct"] <= acos_pct)
+    )
 
-    active_filter = st.session_state.get("active_filter", "All")
-    if active_filter == "Zero Orders":
-        view_df = df[df["orders"] == 0].copy()
-    elif active_filter == "High ACoS":
-        view_df = df[(df["orders"] > 0) & (df["acosPct"] > 30)].copy()
-    else:
-        view_df = df.copy()
+    neg_df = df_f[neg_mask].copy().reset_index(drop=True)
+    win_df = df_f[win_mask].copy().reset_index(drop=True)
 
-    st.markdown(f"### Flagged Terms ({active_filter}) — {len(view_df)} shown")
+    kw_sets = build_kw_sets(kw_by_profile)
 
-    if view_df.empty:
-        st.info("No flagged terms match current filter. Try 'Refresh Data' or check the API Debug Info above.")
-    else:
-        editable_cols = [
-            "selected", "searchTerm", "campaignName", "adGroupName",
-            "clicks", "spend", "orders", "acosPct", "reason", "accountLabel",
-        ]
-        edited = st.data_editor(
-            view_df[editable_cols],
-            hide_index=True,
-            width="stretch",
-            disabled=["searchTerm", "campaignName", "adGroupName", "clicks", "spend", "orders", "acosPct", "reason", "accountLabel"],
-            column_config={
-                "selected": st.column_config.CheckboxColumn("✓ Negate?"),
-                "clicks": st.column_config.NumberColumn("Clicks", format="%d"),
-                "spend": st.column_config.NumberColumn("Spend (₹)", format="%.0f"),
-                "acosPct": st.column_config.NumberColumn("ACoS %", format="%.0f%%"),
-            },
-            key="editor",
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TABS
+    # ═══════════════════════════════════════════════════════════════════════════
+    tab1, tab2 = st.tabs([
+        f"🚫 Negative Review  ({len(neg_df)})",
+        f"🚀 Scale Winners  ({len(win_df)})",
+    ])
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — NEGATIVE REVIEW
+    # ═══════════════════════════════════════════════════════════════════════════
+    with tab1:
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Terms Flagged",   len(neg_df))
+        k2.metric("Wasted Spend",    f"₹{neg_df['spend'].sum():,.0f}")
+        k3.metric("ACoS Threshold",  f"{acos_pct}%")
+
+        # Sub-filter buttons
+        st.markdown("**Filter:**")
+        b1, b2, b3 = st.columns(3)
+        if b1.button("All",         key="nf_all"):  st.session_state["neg_f"] = "All"
+        if b2.button("Zero Orders", key="nf_zero"): st.session_state["neg_f"] = "Zero Orders"
+        if b3.button("High ACoS",   key="nf_high"): st.session_state["neg_f"] = "High ACoS"
+        nf = st.session_state.get("neg_f", "All")
+
+        view = (
+            neg_df[neg_df["orders"] == 0].copy() if nf == "Zero Orders" else
+            neg_df[neg_df["orders"] > 0].copy()  if nf == "High ACoS"   else
+            neg_df.copy()
         )
 
-        if not edited.empty:
-            selection_map = dict(zip(view_df["id"], edited["selected"]))
-            st.session_state["terms_df"]["selected"] = st.session_state["terms_df"].apply(
-                lambda r: selection_map.get(r["id"], r["selected"]), axis=1
+        # Add selected column
+        if "neg_selected" not in st.session_state:
+            st.session_state["neg_selected"] = {row["id"]: True for _, row in neg_df.iterrows()}
+        view["selected"] = view["id"].map(lambda x: st.session_state["neg_selected"].get(x, True))
+
+        st.markdown(f"**{len(view)} terms** · {nf}")
+
+        if not view.empty:
+            cols = ["selected", "searchTerm", "campaignName", "adGroupName",
+                    "clicks", "spend", "orders", "acosPct", "accountLabel"]
+            edited = st.data_editor(
+                view[cols].reset_index(drop=True),
+                hide_index=True,
+                use_container_width=True,
+                disabled=["searchTerm", "campaignName", "adGroupName",
+                          "clicks", "spend", "orders", "acosPct", "accountLabel"],
+                column_config={
+                    "selected":  st.column_config.CheckboxColumn("✓ Negate?"),
+                    "clicks":    st.column_config.NumberColumn("Clicks",    format="%d"),
+                    "spend":     st.column_config.NumberColumn("Spend ₹",   format="%.0f"),
+                    "acosPct":   st.column_config.NumberColumn("ACoS %",    format="%.0f%%"),
+                    "accountLabel": st.column_config.TextColumn("Account"),
+                },
+                key="neg_editor",
+            )
+            # Persist checkbox state
+            if not edited.empty:
+                for idx, row in edited.iterrows():
+                    st.session_state["neg_selected"][view.iloc[idx]["id"]] = row["selected"]
+
+        sel_ids = [k for k, v in st.session_state.get("neg_selected", {}).items() if v]
+        sel_df  = neg_df[neg_df["id"].isin(sel_ids)]
+        st.info(f"**{len(sel_df)}** terms selected · Wasted spend: **₹{sel_df['spend'].sum():,.0f}**")
+
+        if st.button("🚫 Apply Negatives", type="primary", disabled=sel_df.empty, key="apply_neg"):
+            with st.spinner("Applying negatives…"):
+                token   = _get_token(st.secrets["AMAZON_CLIENT_ID"],
+                                     st.secrets["AMAZON_CLIENT_SECRET"],
+                                     st.secrets["AMAZON_REFRESH_TOKEN"])
+                results = apply_negatives(token, sel_df.to_dict("records"))
+            st.success(f"✅ {len(results['success'])} added, {len(results['errors'])} errors.")
+            if results["errors"]:
+                st.error("Errors:")
+                st.json(results["errors"][:20])
+
+        st.divider()
+        st.caption("📅 Data cached 6 hours. Click 🔄 Refresh to force new pull.")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — SCALE WINNERS
+    # ═══════════════════════════════════════════════════════════════════════════
+    with tab2:
+        if win_df.empty:
+            st.info(f"No winners yet. Try lowering ACoS threshold (now {acos_pct}%) or Min Clicks/Orders.")
+            st.stop()
+
+        # Build coverage columns
+        cov_rows = []
+        for _, row in win_df.iterrows():
+            cov = check_coverage(row["searchTerm"], row["profile"], kw_sets)
+            cov_rows.append({
+                **row.to_dict(),
+                "has_exact":     cov["EXACT"],
+                "has_phrase":    cov["PHRASE"],
+                "has_broad":     cov["BROAD"],
+                "missing_exact": not cov["EXACT"],
+            })
+        cov_df = pd.DataFrame(cov_rows)
+
+        missing_count = int(cov_df["missing_exact"].sum())
+
+        w1, w2, w3, w4 = st.columns(4)
+        w1.metric("Winning Terms",      len(cov_df))
+        w2.metric("Total Revenue",      f"₹{cov_df['sales'].sum():,.0f}")
+        w3.metric("Avg ACoS",           f"{cov_df['acosPct'].mean():.1f}%")
+        w4.metric("Missing [Exact]",    missing_count,
+                  delta=f"{missing_count} to create" if missing_count else "All covered",
+                  delta_color="inverse" if missing_count else "off")
+
+        if missing_count > 0:
+            st.warning(
+                f"⚡ **{missing_count} converting search terms are not targeted as [Exact] match** — "
+                "add them as exact keywords or promote to single-keyword campaigns (SKAGs)."
             )
 
-    selected_df = st.session_state["terms_df"][st.session_state["terms_df"]["selected"] == True].copy()
-    st.info(f"Selected terms to negate: **{len(selected_df)}**  |  Wasted spend covered: **₹{selected_df['spend'].sum():,.0f}**")
+        # ── Full winners table ─────────────────────────────────────────────
+        st.markdown("### Winners — Keyword Coverage")
+        st.caption("✅ = already targeted as this match type  ·  ❌ = gap (opportunity)")
 
-    if st.button("🚫 Apply Negatives", type="primary", disabled=selected_df.empty):
-        with st.spinner("Applying negatives to Amazon Ads..."):
-            token = _get_token(
-                st.secrets["AMAZON_CLIENT_ID"],
-                st.secrets["AMAZON_CLIENT_SECRET"],
-                st.secrets["AMAZON_REFRESH_TOKEN"],
+        disp = cov_df[[
+            "searchTerm", "campaignName", "adGroupName",
+            "clicks", "orders", "spend", "sales", "acosPct",
+            "accountLabel", "has_exact", "has_phrase", "has_broad",
+        ]].copy()
+        disp["has_exact"]  = disp["has_exact"].map({True: "✅", False: "❌ Missing"})
+        disp["has_phrase"] = disp["has_phrase"].map({True: "✅", False: "❌ Missing"})
+        disp["has_broad"]  = disp["has_broad"].map({True: "✅", False: "❌ Missing"})
+
+        st.dataframe(
+            disp.sort_values("spend", ascending=False).reset_index(drop=True),
+            use_container_width=True,
+            column_config={
+                "searchTerm":   st.column_config.TextColumn("Search Term",  width="medium"),
+                "campaignName": st.column_config.TextColumn("Campaign",     width="medium"),
+                "adGroupName":  st.column_config.TextColumn("Ad Group",     width="small"),
+                "clicks":       st.column_config.NumberColumn("Clicks",     format="%d"),
+                "orders":       st.column_config.NumberColumn("Orders",     format="%d"),
+                "spend":        st.column_config.NumberColumn("Spend ₹",    format="%.0f"),
+                "sales":        st.column_config.NumberColumn("Revenue ₹",  format="%.0f"),
+                "acosPct":      st.column_config.NumberColumn("ACoS %",     format="%.1f%%"),
+                "accountLabel": st.column_config.TextColumn("Account"),
+                "has_exact":    st.column_config.TextColumn("[Exact]"),
+                "has_phrase":   st.column_config.TextColumn('"Phrase"'),
+                "has_broad":    st.column_config.TextColumn("Broad"),
+            },
+            hide_index=True,
+        )
+
+        st.divider()
+
+        # ── Add missing exact keywords ─────────────────────────────────────
+        miss_df = cov_df[cov_df["missing_exact"]].copy().reset_index(drop=True)
+
+        if not miss_df.empty:
+            st.markdown(f"### ➕ Create {len(miss_df)} Missing [Exact] Keywords")
+            st.caption(
+                "These winning terms convert well but aren't targeted as exact match anywhere. "
+                "Adding them as exact keywords in the originating ad group locks in the signal. "
+                "For full SKAG isolation, move them to a dedicated single-keyword campaign after creation."
             )
-            results = apply_negatives(token, selected_df.to_dict("records"))
-        st.success(f"Done! {len(results['success'])} added, {len(results['errors'])} errors.")
-        if results["errors"]:
-            st.error("Some failed:")
-            st.json(results["errors"][:20])
 
-    st.divider()
-    st.caption("📅 Data is cached for 7 days. Use 🔄 Refresh Data to force a new pull.")
+            ba, bb, bc = st.columns([1, 1, 2])
+            with ba:
+                bid = st.number_input("Bid per keyword ₹", min_value=1.0, max_value=500.0,
+                                      value=10.0, step=0.5, key="exact_bid")
+            with bb:
+                st.write("")
+                create_btn = st.button(
+                    f"➕ Add {len(miss_df)} as [Exact]",
+                    type="primary", key="create_exact",
+                )
+            with bc:
+                csv_bytes = miss_df.to_csv(index=False).encode()
+                st.download_button(
+                    "📥 Export Missing Exact as CSV",
+                    csv_bytes,
+                    f"menhood_missing_exact_{end}.csv",
+                    "text/csv",
+                    key="dl_missing",
+                )
+
+            # Preview
+            st.dataframe(
+                miss_df[[
+                    "searchTerm", "campaignName", "adGroupName",
+                    "clicks", "orders", "acosPct", "accountLabel",
+                ]].reset_index(drop=True),
+                use_container_width=True,
+                column_config={
+                    "acosPct": st.column_config.NumberColumn("ACoS %", format="%.1f%%"),
+                    "clicks":  st.column_config.NumberColumn("Clicks",  format="%d"),
+                    "orders":  st.column_config.NumberColumn("Orders",  format="%d"),
+                },
+                hide_index=True,
+            )
+
+            if create_btn:
+                with st.spinner(f"Creating {len(miss_df)} exact keywords at ₹{bid:.0f} bid…"):
+                    token   = _get_token(st.secrets["AMAZON_CLIENT_ID"],
+                                         st.secrets["AMAZON_CLIENT_SECRET"],
+                                         st.secrets["AMAZON_REFRESH_TOKEN"])
+                    results = add_exact_keywords(token, miss_df.to_dict("records"), bid)
+                if results["errors"]:
+                    st.warning(f"⚠️ {len(results['success'])} created · {len(results['errors'])} errors")
+                    st.json(results["errors"][:10])
+                else:
+                    st.success(f"✅ {len(results['success'])} exact keywords created!")
+                    st.info("💡 Next: move each to a dedicated single-keyword campaign for full SKAG control.")
+
+        st.divider()
+
+        # Full winners export
+        full_csv = cov_df.to_csv(index=False).encode()
+        st.download_button(
+            "📥 Export All Winners to CSV",
+            full_csv,
+            f"menhood_winners_{end}.csv",
+            "text/csv",
+            key="dl_all",
+        )
 
 
 if __name__ == "__main__":
