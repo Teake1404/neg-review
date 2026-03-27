@@ -525,7 +525,7 @@ def main() -> None:
 
         disp = cov_df[[
             "searchTerm", "campaignName", "adGroupName",
-            "clicks", "orders", "spend", "sales", "acosPct",
+            "clicks", "cpc", "orders", "spend", "sales", "acosPct",
             "accountLabel", "has_exact", "has_phrase", "has_broad",
         ]].copy()
         disp["has_exact"]  = disp["has_exact"].map({True: "✅", False: "❌ Missing"})
@@ -540,6 +540,7 @@ def main() -> None:
                 "campaignName": st.column_config.TextColumn("Campaign",     width="medium"),
                 "adGroupName":  st.column_config.TextColumn("Ad Group",     width="small"),
                 "clicks":       st.column_config.NumberColumn("Clicks",     format="%d"),
+                "cpc":          st.column_config.NumberColumn("CPC ₹",      format="%.2f"),
                 "orders":       st.column_config.NumberColumn("Orders",     format="%d"),
                 "spend":        st.column_config.NumberColumn("Spend ₹",    format="%.0f"),
                 "sales":        st.column_config.NumberColumn("Revenue ₹",  format="%.0f"),
