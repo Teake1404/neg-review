@@ -126,6 +126,7 @@ def fetch_report_data_cached(
                 orders = int(row.get("purchases30d", 0) or 0)
                 clicks = int(row.get("clicks",       0) or 0)
                 acos   = spend / sales if sales > 0 else None
+                cpc    = round(spend / clicks, 2) if clicks > 0 else None
                 rows.append({
                     "id":           f"{row.get('campaignId')}_{row.get('adGroupId')}_{row.get('searchTerm','')}",
                     "searchTerm":   row.get("searchTerm", ""),
@@ -134,6 +135,7 @@ def fetch_report_data_cached(
                     "adGroupId":    str(row.get("adGroupId", "")),
                     "adGroupName":  row.get("adGroupName", ""),
                     "clicks":  clicks,
+                    "cpc":     cpc,
                     "spend":   round(spend, 2),
                     "sales":   round(sales,  2),
                     "orders":  orders,
@@ -440,16 +442,17 @@ def main() -> None:
 
         if not view.empty:
             cols = ["selected", "searchTerm", "campaignName", "adGroupName",
-                    "clicks", "spend", "orders", "acosPct", "accountLabel"]
+                    "clicks", "cpc", "spend", "orders", "acosPct", "accountLabel"]
             edited = st.data_editor(
                 view[cols].reset_index(drop=True),
                 hide_index=True,
                 use_container_width=True,
                 disabled=["searchTerm", "campaignName", "adGroupName",
-                          "clicks", "spend", "orders", "acosPct", "accountLabel"],
+                          "clicks", "cpc", "spend", "orders", "acosPct", "accountLabel"],
                 column_config={
                     "selected":  st.column_config.CheckboxColumn("✓ Negate?"),
                     "clicks":    st.column_config.NumberColumn("Clicks",    format="%d"),
+                    "cpc":       st.column_config.NumberColumn("CPC ₹",     format="%.2f"),
                     "spend":     st.column_config.NumberColumn("Spend ₹",   format="%.0f"),
                     "acosPct":   st.column_config.NumberColumn("ACoS %",    format="%.0f%%"),
                     "accountLabel": st.column_config.TextColumn("Account"),
