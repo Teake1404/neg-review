@@ -174,22 +174,29 @@ def fetch_keywords_cached(
         "Accept":                          "application/vnd.spKeyword.v3+json",
     }
 
-    keywords, start_index = [], 0
+    keywords: List[Dict] = []
+    next_token = None
     while True:
+        body: Dict = {
+            "maxResults": 1000,
+            "stateFilter": {"include": ["ENABLED", "PAUSED"]},
+        }
+        if next_token:
+            body["nextToken"] = next_token
         r = requests.post(
             f"{EU_API}/sp/keywords/list",
             headers=headers,
-            json={"maxResults": 1000, "startIndex": start_index,
-                  "stateFilter": "ENABLED,PAUSED"},
+            json=body,
             timeout=30,
         )
         if r.status_code >= 400:
             return keywords, f"Keywords fetch {r.status_code}: {r.text[:200]}"
-        batch = r.json().get("keywords", [])
+        data = r.json()
+        batch = data.get("keywords", [])
         keywords.extend(batch)
-        if len(batch) < 1000:
+        next_token = data.get("nextToken")
+        if not next_token:
             break
-        start_index += 1000
 
     return keywords, ""
 
@@ -230,7 +237,7 @@ def load_all_data(force: bool = False):
         kws, kw_err = fetch_keywords_cached(cid, sec, tok, pid, bust)
         debug_lines.append(
             f"⚠️ {label} keywords: {kw_err}" if kw_err
-            else f"✅ {label}: {len(kws)} keywords"
+            else f"✅ {label}: SP keywords list API fetched {len(kws)} keywords"
         )
         kw_by_profile[pid] = kws
 
