@@ -5,7 +5,9 @@ Open: http://localhost:5050
 """
 
 from flask import Flask, render_template_string, jsonify, request, make_response
-import requests, json, time, gzip, threading, os, io, csv
+import requests, json, time, gzip, threading, os, io, csv, smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2, psycopg2.extras
 from datetime import datetime, timedelta, timezone
@@ -470,6 +472,92 @@ def api_prefetch():
         return jsonify({"status": "refreshed", "count": result.get("count", 0)})
     return jsonify({"status": "started", "message": "Background fetch triggered"})
 
+def send_email_notification(subject: str, html_body: str):
+    """Send email via Gmail SMTP. Requires GMAIL_USER and GMAIL_APP_PASSWORD env vars."""
+    gmail_user = os.getenv("GMAIL_USER", "")
+    gmail_pass = os.getenv("GMAIL_APP_PASSWORD", "")
+    to_email   = os.getenv("NOTIFY_EMAIL", "rajeshwadhwa28@gmail.com")
+
+    if not gmail_user or not gmail_pass:
+        print("EMAIL: GMAIL_USER or GMAIL_APP_PASSWORD not set — skipping notification", flush=True)
+        return
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = gmail_user
+        msg["To"]      = to_email
+        msg.attach(MIMEText(html_body, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as server:
+            server.login(gmail_user, gmail_pass)
+            server.sendmail(gmail_user, to_email, msg.as_string())
+        print(f"EMAIL: sent '{subject}' to {to_email}", flush=True)
+    except Exception as e:
+        print(f"EMAIL ERROR: {e}", flush=True)
+
+
+def _build_negatives_email(approved: list, added: int, errors: int) -> str:
+    """Build HTML email summary for applied negatives."""
+    now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+    total_spend = sum(float(t.get("spend", 0)) for t in approved)
+
+    rows = ""
+    for t in approved[:50]:  # cap at 50 rows in email
+        rows += f"""
+        <tr>
+          <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">{t.get('searchTerm','')}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">{t.get('campaignName','')[:40]}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;color:#ef4444;font-weight:bold;">₹{float(t.get('spend',0)):,.0f}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">{t.get('accountLabel','')}</td>
+        </tr>"""
+
+    more = f"<p style='color:#6b7280;font-size:13px;'>...and {len(approved)-50} more terms</p>" if len(approved) > 50 else ""
+
+    return f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:700px;margin:0 auto;">
+      <div style="background:#0D0D0D;padding:32px 40px;border-radius:12px 12px 0 0;">
+        <h1 style="color:#fff;font-size:22px;margin:0;">🚫 Negatives Applied — Menhood</h1>
+        <p style="color:#9ca3af;margin:8px 0 0;font-size:14px;">{now_ist}</p>
+      </div>
+      <div style="background:#fff;border:1px solid #e5e7eb;padding:32px 40px;">
+        <div style="display:flex;gap:24px;margin-bottom:28px;flex-wrap:wrap;">
+          <div style="background:#f9fafb;border-radius:10px;padding:16px 24px;flex:1;min-width:120px;">
+            <div style="font-size:28px;font-weight:800;color:#ef4444;">{added}</div>
+            <div style="font-size:12px;color:#6b7280;margin-top:4px;">Negatives Added</div>
+          </div>
+          <div style="background:#f9fafb;border-radius:10px;padding:16px 24px;flex:1;min-width:120px;">
+            <div style="font-size:28px;font-weight:800;color:#FF6B35;">₹{total_spend:,.0f}</div>
+            <div style="font-size:12px;color:#6b7280;margin-top:4px;">Monthly Spend Stopped</div>
+          </div>
+          <div style="background:#f9fafb;border-radius:10px;padding:16px 24px;flex:1;min-width:120px;">
+            <div style="font-size:28px;font-weight:800;color:{'#10b981' if errors==0 else '#f59e0b'};">{errors}</div>
+            <div style="font-size:12px;color:#6b7280;margin-top:4px;">Errors</div>
+          </div>
+        </div>
+        <h3 style="font-size:14px;font-weight:700;color:#111;margin-bottom:12px;">Terms negated</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr style="background:#0D0D0D;color:#fff;">
+              <th style="padding:8px 10px;text-align:left;">Search Term</th>
+              <th style="padding:8px 10px;text-align:left;">Campaign</th>
+              <th style="padding:8px 10px;text-align:left;">Spend</th>
+              <th style="padding:8px 10px;text-align:left;">Account</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+        {more}
+      </div>
+      <div style="background:#f9fafb;border:1px solid #e5e7eb;border-top:0;padding:16px 40px;border-radius:0 0 12px 12px;">
+        <p style="color:#9ca3af;font-size:12px;margin:0;">
+          Sent by NegAuto · Menhood Ads Keyword Review ·
+          <a href="https://neg-reviewde.replit.app" style="color:#FF6B35;">Open app</a>
+        </p>
+      </div>
+    </div>"""
+
+
 @app.route("/api/apply", methods=["POST"])
 def api_apply():
     data     = request.json
@@ -502,8 +590,21 @@ def api_apply():
             results["success"].extend(rd.get("negativeKeywords", {}).get("success", []))
             results["errors"].extend(rd.get("negativeKeywords", {}).get("error", []))
 
-    return jsonify({"status": "applied", "added": len(results["success"]),
-                    "errors": len(results["errors"]), "detail": results})
+    added  = len(results["success"])
+    errors = len(results["errors"])
+
+    # Send email notification in background thread (non-blocking)
+    if added > 0:
+        subject   = f"🚫 {added} negatives applied — ₹{sum(float(t.get('spend',0)) for t in approved):,.0f} spend stopped"
+        html_body = _build_negatives_email(approved, added, errors)
+        threading.Thread(
+            target=send_email_notification,
+            args=(subject, html_body),
+            daemon=True,
+        ).start()
+
+    return jsonify({"status": "applied", "added": added,
+                    "errors": errors, "detail": results})
 
 @app.route("/api/add_keywords", methods=["POST"])
 def api_add_keywords():
