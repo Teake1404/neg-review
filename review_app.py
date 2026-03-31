@@ -6,8 +6,8 @@ Open: http://localhost:5050
 
 from flask import Flask, render_template_string, jsonify, request, make_response
 import requests, json, time, gzip, threading, os, io, csv, smtplib
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2, psycopg2.extras
 from datetime import datetime, timedelta, timezone
@@ -499,11 +499,11 @@ def send_email_notification(subject: str, html_body: str):
 
 def _build_negatives_email(approved: list, added: int, errors: int) -> str:
     """Build HTML email summary for applied negatives."""
-    now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+    now_ist     = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
     total_spend = sum(float(t.get("spend", 0)) for t in approved)
 
     rows = ""
-    for t in approved[:50]:  # cap at 50 rows in email
+    for t in approved[:50]:
         rows += f"""
         <tr>
           <td style="padding:6px 10px;border-bottom:1px solid #f3f4f6;">{t.get('searchTerm','')}</td>
@@ -593,15 +593,11 @@ def api_apply():
     added  = len(results["success"])
     errors = len(results["errors"])
 
-    # Send email notification in background thread (non-blocking)
     if added > 0:
         subject   = f"🚫 {added} negatives applied — ₹{sum(float(t.get('spend',0)) for t in approved):,.0f} spend stopped"
         html_body = _build_negatives_email(approved, added, errors)
-        threading.Thread(
-            target=send_email_notification,
-            args=(subject, html_body),
-            daemon=True,
-        ).start()
+        threading.Thread(target=send_email_notification, args=(subject, html_body),
+                         daemon=True).start()
 
     return jsonify({"status": "applied", "added": added,
                     "errors": errors, "detail": results})
