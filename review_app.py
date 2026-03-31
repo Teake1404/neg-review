@@ -764,7 +764,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, b
             f"{EU_API}/sp/campaigns",
             headers={**base_hdrs, "Content-Type": "application/vnd.spCampaign.v3+json",
                                   "Accept":       "application/vnd.spCampaign.v3+json"},
-            json={"campaigns": [{"name": f"SP|Self-Target|{asin}",
+            json={"campaigns": [{"name": f"SP|Self-Target|{asin}|{today_str}",
                                  "targetingType": "MANUAL", "state": "ENABLED",
                                  "budget": {"budgetType": "DAILY", "budget": daily_budget},
                                  "startDate": today_str}]},
@@ -1882,11 +1882,12 @@ async function createSelfTargets() {
     const d = await r.json();
 
     if (d.errors > 0) {
-      // Build a readable error from the first failed item
+      // Always log full detail to browser console for debugging
+      console.error('[Self-Target] creation errors:', d.detail.errors);
       const firstErr = (d.detail.errors || [])[0] || {};
       const errMsg = firstErr.msg || JSON.stringify(firstErr);
-      const step   = firstErr.step ? ` (step: ${firstErr.step})` : '';
-      showToast(`⚠️ ${d.created} created, ${d.errors} failed${step}: ${errMsg}`, 8000);
+      const step   = firstErr.step ? `[${firstErr.step}] ` : '';
+      showToast(`⚠️ ${d.created} created, ${d.errors} failed — ${step}${errMsg}`, 10000);
     } else {
       document.getElementById('st-modal').classList.remove('open');
       showToast(`✅ ${d.created} self-targeting campaign(s) created!`);
