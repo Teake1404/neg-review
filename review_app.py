@@ -820,7 +820,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, b
                      "Accept":       "application/vnd.spTargetingClause.v3+json"},
             json={"targetingClauses": [{"campaignId": campaign_id, "adGroupId": ad_group_id,
                                         "state": "ENABLED", "bid": asin_bid,
-                                        "expression": [{"type": "asinSameAs", "value": asin}],
+                                        "expression": [{"type": "ASIN_SAME_AS", "value": asin}],
                                         "expressionType": "MANUAL"}]},
             timeout=30)
         if r.status_code >= 400:
