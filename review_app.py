@@ -835,22 +835,25 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget):
 
 @app.route("/api/self_target/asins")
 def api_self_target_asins():
-    """Return all active product ad ASINs across both profiles."""
+    """Return all active product ad ASINs for the Prepaid account (Account B) only."""
     try:
         token = get_token()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    all_ads, errors = [], []
-    for pid, label in PROFILES.items():
-        ads, err = _fetch_product_ads_for_profile(token, pid, label)
-        all_ads.extend(ads)
-        if err:
-            errors.append(err)
+    # Prepaid account only (Account B) — Rajesh confirmed this tab is for Prepaid.
+    PREPAID_PID = os.getenv("MENHOOD_PROFILE_2", "154697331411051")
+    prepaid_label = PROFILES.get(PREPAID_PID, "Account B (Prepaid)")
 
-    # Step 1: From the FULL unfiltered list, build the set of ASINs already in any
-    # self-targeting campaign. Must happen before winner_pairs filter strips those rows out.
-    # Matches: "SP|Self-Target|..." (our format) and "Self PT..." (Rajesh's existing experiments).
+    all_ads, errors = [], []
+    ads, err = _fetch_product_ads_for_profile(token, PREPAID_PID, prepaid_label)
+    all_ads.extend(ads)
+    if err:
+        errors.append(err)
+
+    # Exclude ASINs already in any self-targeting campaign.
+    # Build from full list first so cross-campaign dupes are caught.
+    # Matches: "SP|Self-Target|..." (our format) and "Self PT..." (Rajesh's existing ones).
     def _is_self_targeting(name):
         n = (name or "").lower()
         return n.startswith("sp|self-target|") or "self pt" in n
@@ -860,23 +863,6 @@ def api_self_target_asins():
         for ad in all_ads
         if _is_self_targeting(ad.get("campaignName", "")) and ad.get("asin")
     }
-
-    # Step 2: Filter to ad groups that produced real winners (spend>0 & orders>0).
-    # Falls back to all enabled product ads if cache is empty.
-    winner_pairs = _winner_pairs_from_cache()
-    if winner_pairs:
-        filtered = []
-        for ad in all_ads:
-            key = (str(ad.get("profile", "")),
-                   str(ad.get("campaignId", "")),
-                   str(ad.get("adGroupId", "")))
-            if key in winner_pairs:
-                filtered.append(ad)
-        all_ads = filtered
-    else:
-        errors.append("No winner pairs in cache — showing all enabled product ads.")
-
-    # Step 3: Remove any ASIN that already has self-targeting anywhere (cross-campaign).
     pre_filter = len(all_ads)
     all_ads = [
         ad for ad in all_ads
@@ -1741,9 +1727,11 @@ async function loadSelfTargetAsins() {
 
 function _populateProfileSelect() {
   const sel = document.getElementById('st-manual-profile');
-  sel.innerHTML = '<option value="" disabled selected>— choose —</option>';
-  for (const [pid, label] of Object.entries(stProfiles))
-    sel.innerHTML += `<option value="${pid}">${label}</option>`;
+  sel.innerHTML = '';
+  for (const [pid, label] of Object.entries(stProfiles)) {
+    const isPrepaid = label.toLowerCase().includes('prepaid');
+    sel.innerHTML += `<option value="${pid}"${isPrepaid ? ' selected' : ''}>${label}</option>`;
+  }
 }
 
 function stAddManual() {
