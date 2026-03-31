@@ -1149,8 +1149,18 @@ tr.brand-row td{background:#fefce8!important}
       </div>
       <button class="modal-close" onclick="document.getElementById('st-modal').classList.remove('open')">✕</button>
     </div>
-    <div style="padding:0 20px 8px;color:#64748b;font-size:12px">
-      Bid: <strong id="st-preview-bid">—</strong> &nbsp;·&nbsp; Daily budget: <strong id="st-preview-budget">—</strong>
+    <div style="padding:8px 20px 12px;display:flex;gap:20px;align-items:flex-end;border-bottom:1px solid var(--b);margin-bottom:4px">
+      <div>
+        <label style="font-size:11px;font-weight:700;color:#64748b;display:block;margin-bottom:4px">Bid per target ₹</label>
+        <input id="st-modal-bid" type="number" min="1" max="9999" step="0.5"
+               style="width:100px;padding:7px 10px;border:1px solid var(--b);border-radius:6px;font-size:13px;font-weight:700">
+      </div>
+      <div>
+        <label style="font-size:11px;font-weight:700;color:#64748b;display:block;margin-bottom:4px">Daily budget ₹</label>
+        <input id="st-modal-budget" type="number" min="1" max="99999" step="10"
+               style="width:110px;padding:7px 10px;border:1px solid var(--b);border-radius:6px;font-size:13px;font-weight:700">
+      </div>
+      <div style="font-size:11px;color:#94a3b8;padding-bottom:8px">Changes here apply to all campaigns being created</div>
     </div>
     <div style="overflow-y:auto;max-height:420px;padding:0 20px 16px">
       <table id="st-preview-table" style="font-size:12px">
@@ -1807,10 +1817,9 @@ function renderStTable() {
 function showStPreview() {
   const selected = stAsins.filter(a => a.checked);
   if (!selected.length) return;
-  const bid    = parseFloat(document.getElementById('st-bid').value) || 5;
-  const budget = parseFloat(document.getElementById('st-budget').value) || 100;
-  document.getElementById('st-preview-bid').textContent    = '₹' + bid;
-  document.getElementById('st-preview-budget').textContent = '₹' + budget + '/day';
+  // Sync main tab bid/budget into modal inputs so Rajesh can adjust before confirming
+  document.getElementById('st-modal-bid').value    = document.getElementById('st-bid').value || 5;
+  document.getElementById('st-modal-budget').value = document.getElementById('st-budget').value || 100;
   const rows = selected.map(a => `<tr>
     <td class="mono" style="font-weight:700">${a.asin}</td>
     <td style="font-size:11px">SP|Self-Target|${a.asin}</td>
@@ -1830,8 +1839,9 @@ function closeStModal(e) {
 async function createSelfTargets() {
   const selected = stAsins.filter(a => a.checked);
   if (!selected.length) return;
-  const bid    = parseFloat(document.getElementById('st-bid').value) || 5;
-  const budget = parseFloat(document.getElementById('st-budget').value) || 100;
+  // Read from modal inputs (Rajesh may have changed them before confirming)
+  const bid    = parseFloat(document.getElementById('st-modal-bid').value) || 5;
+  const budget = parseFloat(document.getElementById('st-modal-budget').value) || 100;
 
   const btn = document.getElementById('st-confirm-btn');
   btn.disabled = true;
