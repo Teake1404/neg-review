@@ -848,7 +848,20 @@ def api_self_target_asins():
         if err:
             errors.append(err)
 
-    # Filter to ASINs running in ad groups that produced real winners (spend>0 & orders>0).
+    # Step 1: From the FULL unfiltered list, build the set of ASINs already in any
+    # self-targeting campaign. Must happen before winner_pairs filter strips those rows out.
+    # Matches: "SP|Self-Target|..." (our format) and "Self PT..." (Rajesh's existing experiments).
+    def _is_self_targeting(name):
+        n = (name or "").lower()
+        return n.startswith("sp|self-target|") or "self pt" in n
+
+    already_targeted = {
+        (ad.get("profile", ""), ad.get("asin", ""))
+        for ad in all_ads
+        if _is_self_targeting(ad.get("campaignName", "")) and ad.get("asin")
+    }
+
+    # Step 2: Filter to ad groups that produced real winners (spend>0 & orders>0).
     # Falls back to all enabled product ads if cache is empty.
     winner_pairs = _winner_pairs_from_cache()
     if winner_pairs:
@@ -863,25 +876,14 @@ def api_self_target_asins():
     else:
         errors.append("No winner pairs in cache — showing all enabled product ads.")
 
-    # Collect all ASINs (by profile) that already appear in ANY self-targeting campaign,
-    # then exclude them entirely — even if they also run in other non-self-targeting campaigns.
-    # Matches: "SP|Self-Target|..." (our format) and "Self PT..." (Rajesh's existing experiments).
-    def _is_self_targeting(name):
-        n = (name or "").lower()
-        return n.startswith("sp|self-target|") or "self pt" in n
-
-    already_targeted = {
-        (ad.get("profile", ""), ad.get("asin", ""))
-        for ad in all_ads
-        if _is_self_targeting(ad.get("campaignName", "")) and ad.get("asin")
-    }
+    # Step 3: Remove any ASIN that already has self-targeting anywhere (cross-campaign).
     pre_filter = len(all_ads)
     all_ads = [
         ad for ad in all_ads
         if (ad.get("profile", ""), ad.get("asin", "")) not in already_targeted
     ]
-    excluded = pre_filter - len(all_ads)
-    if excluded:
+    excluded_count = pre_filter - len(all_ads)
+    if excluded_count:
         errors.append(f"Excluded {len(already_targeted)} ASINs already in self-targeting campaigns.")
 
     seen, unique = set(), []
