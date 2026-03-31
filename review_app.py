@@ -647,7 +647,7 @@ def api_add_keywords():
 # ── SELF-TARGET HELPERS ────────────────────────────────────────────────────────
 
 def _fetch_product_ads_for_profile(token, profile_id, profile_label):
-    """Fetch all ENABLED product ads (ASINs) for a profile via pagination."""
+    """Fetch all ENABLED product ads and enrich with campaign/ad group names."""
     headers = {
         "Amazon-Advertising-API-ClientId": CLIENT_ID,
         "Amazon-Advertising-API-Scope":    profile_id,
@@ -672,6 +672,71 @@ def _fetch_product_ads_for_profile(token, profile_id, profile_label):
         next_token = data.get("nextToken")
         if not next_token:
             break
+
+    campaign_ids = sorted({str(ad.get("campaignId")) for ad in ads if ad.get("campaignId")})
+    ad_group_ids = sorted({str(ad.get("adGroupId")) for ad in ads if ad.get("adGroupId")})
+
+    def _fetch_name_map(kind, ids):
+        """Return {id: name} for campaigns/adGroups via list endpoint."""
+        if not ids:
+            return {}
+        if kind == "campaign":
+            endpoint = f"{EU_API}/sp/campaigns/list"
+            ctype = "application/vnd.spCampaign.v3+json"
+            arr_key = "campaigns"
+            id_filter_key = "campaignIdFilter"
+            id_key, name_key = "campaignId", "name"
+        else:
+            endpoint = f"{EU_API}/sp/adGroups/list"
+            ctype = "application/vnd.spAdGroup.v3+json"
+            arr_key = "adGroups"
+            id_filter_key = "adGroupIdFilter"
+            id_key, name_key = "adGroupId", "name"
+
+        local_headers = {
+            "Amazon-Advertising-API-ClientId": CLIENT_ID,
+            "Amazon-Advertising-API-Scope":    profile_id,
+            "Authorization":                   f"Bearer {token}",
+            "Content-Type": ctype,
+            "Accept":       ctype,
+        }
+
+        out = {}
+        for i in range(0, len(ids), 1000):
+            chunk = ids[i:i + 1000]
+            body = {
+                "maxResults": 1000,
+                "stateFilter": {"include": ["ENABLED", "PAUSED", "ARCHIVED"]},
+                id_filter_key: {"include": chunk},
+            }
+            next_token_local = None
+            while True:
+                req_body = dict(body)
+                if next_token_local:
+                    req_body["nextToken"] = next_token_local
+                r = requests.post(endpoint, headers=local_headers, json=req_body, timeout=30)
+                if r.status_code >= 400:
+                    print(f"{kind} name lookup [{profile_id}] {r.status_code}: {r.text[:200]}", flush=True)
+                    break
+                payload = r.json()
+                for obj in payload.get(arr_key, []):
+                    oid = str(obj.get(id_key, ""))
+                    if oid:
+                        out[oid] = obj.get(name_key, "")
+                next_token_local = payload.get("nextToken")
+                if not next_token_local:
+                    break
+        return out
+
+    campaign_name_map = _fetch_name_map("campaign", campaign_ids)
+    ad_group_name_map = _fetch_name_map("adGroup", ad_group_ids)
+
+    for ad in ads:
+        cid = str(ad.get("campaignId", ""))
+        agid = str(ad.get("adGroupId", ""))
+        ad["campaignName"] = campaign_name_map.get(cid, "")
+        ad["adGroupName"]  = ad_group_name_map.get(agid, "")
+
     return ads, ""
 
 
@@ -784,8 +849,11 @@ def api_self_target_asins():
             seen.add(key)
             unique.append({
                 "asin":         ad["asin"],
+                "sku":          ad.get("sku", ""),
                 "profile":      ad["profile"],
                 "profileLabel": ad["profileLabel"],
+                "campaignName": ad.get("campaignName", ""),
+                "adGroupName":  ad.get("adGroupName", ""),
             })
 
     return jsonify({"asins": unique, "errors": errors})
@@ -1595,7 +1663,7 @@ function cpcStr(t) {
 loadData();
 
 // ── SELF-TARGET TAB ───────────────────────────────────────────────────────────
-let stAsins    = [];    // [{asin, profile, profileLabel, checked, manual}]
+let stAsins    = [];    // [{asin, sku, campaignName, adGroupName, profile, profileLabel, checked, manual}]
 let stProfiles = {};    // pid → label
 
 async function loadSelfTargetAsins() {
@@ -1639,7 +1707,16 @@ function stAddManual() {
   if (stAsins.find(a => a.asin === asin && a.profile === pid)) {
     showToast('That ASIN is already in the list'); return;
   }
-  stAsins.push({asin, profile: pid, profileLabel: stProfiles[pid] || pid, checked: true, manual: true});
+  stAsins.push({
+    asin,
+    sku: '',
+    campaignName: '',
+    adGroupName: '',
+    profile: pid,
+    profileLabel: stProfiles[pid] || pid,
+    checked: true,
+    manual: true
+  });
   document.getElementById('st-manual-asin').value = '';
   renderStTable();
 }
@@ -1673,6 +1750,9 @@ function renderStTable() {
     <tr class="${a.checked ? '' : 'unchecked'}">
       <td class="center"><input type="checkbox" ${a.checked?'checked':''} onchange="stToggle(${i})" style="width:16px;height:16px;cursor:pointer"></td>
       <td class="mono" style="font-weight:700">${a.asin}</td>
+      <td class="mono" style="font-size:11px;color:#64748b">${escHtml(a.sku || '—')}</td>
+      <td style="font-size:11px;color:#64748b;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(a.campaignName || '—')}</td>
+      <td style="font-size:11px;color:#94a3b8;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(a.adGroupName || '—')}</td>
       <td style="font-size:11px;color:#64748b">${a.profileLabel}</td>
       <td class="center" style="font-size:11px;color:#94a3b8">${a.manual ? '✏️ Manual' : '🔄 Auto'}</td>
       <td class="center">
@@ -1686,6 +1766,9 @@ function renderStTable() {
       <thead><tr>
         <th class="center" style="width:40px">✓</th>
         <th>ASIN</th>
+        <th>SKU</th>
+        <th>Campaign</th>
+        <th>Ad Group</th>
         <th>Account</th>
         <th class="center">Source</th>
         <th class="center" style="width:50px"></th>
