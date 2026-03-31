@@ -727,6 +727,25 @@ def _fetch_product_ads_for_profile(token, profile_id, profile_label):
     return ads, ""
 
 
+def _winner_pairs_from_cache():
+    """Return {(profile_id, campaign_id, ad_group_id)} with spend>0 and orders>0."""
+    cached = load_cache() or {}
+    pairs = set()
+    for t in cached.get("terms", []):
+        try:
+            spend = float(t.get("spend", 0) or 0)
+            orders = int(t.get("orders", 0) or 0)
+        except Exception:
+            continue
+        if spend > 0 and orders > 0:
+            pairs.add((
+                str(t.get("profile", "")),
+                str(t.get("campaignId", "")),
+                str(t.get("adGroupId", "")),
+            ))
+    return pairs
+
+
 def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget):
     """For each ASIN: campaign → ad group → product ad → asinSameAs target."""
     today_str = datetime.now(IST).strftime("%Y%m%d")
@@ -828,6 +847,22 @@ def api_self_target_asins():
         all_ads.extend(ads)
         if err:
             errors.append(err)
+
+    # Keep only product ads running in ad groups that produced real winners recently.
+    winner_pairs = _winner_pairs_from_cache()
+    if winner_pairs:
+        filtered_ads = []
+        for ad in all_ads:
+            key = (
+                str(ad.get("profile", "")),
+                str(ad.get("campaignId", "")),
+                str(ad.get("adGroupId", "")),
+            )
+            if key in winner_pairs:
+                filtered_ads.append(ad)
+        all_ads = filtered_ads
+    else:
+        errors.append("No winner pairs found in 30-day cache; showing all enabled product ads.")
 
     seen, unique = set(), []
     for ad in all_ads:
