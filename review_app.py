@@ -749,8 +749,9 @@ def _winner_pairs_from_cache():
 def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, bid_map=None):
     """For each ASIN: campaign → ad group → product ad → asinSameAs target.
     bid_map: optional {asin: custom_bid} — falls back to `bid` for missing entries."""
-    today_str = datetime.now(IST).strftime("%Y%m%d")
-    results   = {"success": [], "errors": []}
+    today_str      = datetime.now(IST).strftime("%Y%m%d")   # for campaign name suffix
+    today_iso      = datetime.now(IST).strftime("%Y-%m-%d") # for Amazon startDate field
+    results        = {"success": [], "errors": []}
     base_hdrs = {
         "Amazon-Advertising-API-ClientId": CLIENT_ID,
         "Amazon-Advertising-API-Scope":    profile_id,
@@ -767,7 +768,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, b
             json={"campaigns": [{"name": f"SP|Self-Target|{asin}|{today_str}",
                                  "targetingType": "MANUAL", "state": "ENABLED",
                                  "budget": {"budgetType": "DAILY", "budget": daily_budget},
-                                 "startDate": today_str}]},
+                                 "startDate": today_iso}]},
             timeout=30)
         if r.status_code >= 400:
             results["errors"].append({"asin": asin, "step": "campaign", "msg": r.text[:500]})
