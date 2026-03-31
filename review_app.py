@@ -728,12 +728,12 @@ def _fetch_product_ads_for_profile(token, profile_id, profile_label):
 
 
 def _winner_pairs_from_cache():
-    """Return {(profile_id, campaign_id, ad_group_id)} with spend>0 and orders>0."""
+    """Return set of (profile_id, campaign_id, ad_group_id) tuples with spend>0 and orders>0."""
     cached = load_cache() or {}
     pairs = set()
     for t in cached.get("terms", []):
         try:
-            spend = float(t.get("spend", 0) or 0)
+            spend  = float(t.get("spend", 0) or 0)
             orders = int(t.get("orders", 0) or 0)
         except Exception:
             continue
@@ -848,21 +848,20 @@ def api_self_target_asins():
         if err:
             errors.append(err)
 
-    # Keep only product ads running in ad groups that produced real winners recently.
+    # Filter to ASINs running in ad groups that produced real winners (spend>0 & orders>0).
+    # Falls back to all enabled product ads if cache is empty.
     winner_pairs = _winner_pairs_from_cache()
     if winner_pairs:
-        filtered_ads = []
+        filtered = []
         for ad in all_ads:
-            key = (
-                str(ad.get("profile", "")),
-                str(ad.get("campaignId", "")),
-                str(ad.get("adGroupId", "")),
-            )
+            key = (str(ad.get("profile", "")),
+                   str(ad.get("campaignId", "")),
+                   str(ad.get("adGroupId", "")))
             if key in winner_pairs:
-                filtered_ads.append(ad)
-        all_ads = filtered_ads
+                filtered.append(ad)
+        all_ads = filtered
     else:
-        errors.append("No winner pairs found in 30-day cache; showing all enabled product ads.")
+        errors.append("No winner pairs in cache — showing all enabled product ads.")
 
     seen, unique = set(), []
     for ad in all_ads:
