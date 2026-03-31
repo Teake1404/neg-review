@@ -746,8 +746,9 @@ def _winner_pairs_from_cache():
     return pairs
 
 
-def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget):
-    """For each ASIN: campaign → ad group → product ad → asinSameAs target."""
+def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, bid_map=None):
+    """For each ASIN: campaign → ad group → product ad → asinSameAs target.
+    bid_map: optional {asin: custom_bid} — falls back to `bid` for missing entries."""
     today_str = datetime.now(IST).strftime("%Y%m%d")
     results   = {"success": [], "errors": []}
     base_hdrs = {
@@ -757,6 +758,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget):
     }
 
     for asin in asins:
+        asin_bid = float((bid_map or {}).get(asin, bid))
         # Step 1: Campaign
         r = requests.post(
             f"{EU_API}/sp/campaigns",
@@ -784,7 +786,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget):
             headers={**base_hdrs, "Content-Type": "application/vnd.spAdGroup.v3+json",
                                   "Accept":       "application/vnd.spAdGroup.v3+json"},
             json={"adGroups": [{"name": f"Self|{asin}", "campaignId": campaign_id,
-                                "defaultBid": bid, "state": "ENABLED"}]},
+                                "defaultBid": asin_bid, "state": "ENABLED"}]},
             timeout=30)
         if r.status_code >= 400:
             results["errors"].append({"asin": asin, "step": "adGroup", "msg": r.text[:200]})
@@ -816,7 +818,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget):
                      "Content-Type": "application/vnd.spTargetingClause.v3+json",
                      "Accept":       "application/vnd.spTargetingClause.v3+json"},
             json={"targetingClauses": [{"campaignId": campaign_id, "adGroupId": ad_group_id,
-                                        "state": "ENABLED", "bid": bid,
+                                        "state": "ENABLED", "bid": asin_bid,
                                         "expression": [{"type": "asinSameAs", "value": asin}],
                                         "expressionType": "MANUAL"}]},
             timeout=30)
@@ -905,13 +907,16 @@ def api_self_target_create():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+    # Build per-ASIN bid map (item may carry its own bid from the modal row input)
+    bid_map = {it["asin"]: float(it.get("bid", bid)) for it in items}
+
     by_profile = {}
     for it in items:
         by_profile.setdefault(it["profile"], []).append(it["asin"])
 
     all_success, all_errors = [], []
     for pid, asins in by_profile.items():
-        res = _create_self_target_campaigns(token, pid, asins, bid, daily_budget)
+        res = _create_self_target_campaigns(token, pid, asins, bid, daily_budget, bid_map=bid_map)
         all_success.extend(res["success"])
         all_errors.extend(res["errors"])
 
@@ -1151,16 +1156,20 @@ tr.brand-row td{background:#fefce8!important}
     </div>
     <div style="padding:8px 20px 12px;display:flex;gap:20px;align-items:flex-end;border-bottom:1px solid var(--b);margin-bottom:4px">
       <div>
-        <label style="font-size:11px;font-weight:700;color:#64748b;display:block;margin-bottom:4px">Bid per target ₹</label>
-        <input id="st-modal-bid" type="number" min="1" max="9999" step="0.5"
-               style="width:100px;padding:7px 10px;border:1px solid var(--b);border-radius:6px;font-size:13px;font-weight:700">
+        <label style="font-size:11px;font-weight:700;color:#64748b;display:block;margin-bottom:4px">Default bid ₹</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input id="st-modal-bid" type="number" min="1" max="9999" step="0.5"
+                 style="width:90px;padding:7px 10px;border:1px solid var(--b);border-radius:6px;font-size:13px;font-weight:700">
+          <button class="btn btn-ghost" style="font-size:11px;padding:6px 10px;white-space:nowrap"
+                  onclick="stApplyBidToAll()">Apply to all</button>
+        </div>
       </div>
       <div>
         <label style="font-size:11px;font-weight:700;color:#64748b;display:block;margin-bottom:4px">Daily budget ₹</label>
         <input id="st-modal-budget" type="number" min="1" max="99999" step="10"
                style="width:110px;padding:7px 10px;border:1px solid var(--b);border-radius:6px;font-size:13px;font-weight:700">
       </div>
-      <div style="font-size:11px;color:#94a3b8;padding-bottom:8px">Changes here apply to all campaigns being created</div>
+      <div style="font-size:11px;color:#94a3b8;padding-bottom:8px">Edit individual bids in the Bid ₹ column below</div>
     </div>
     <div style="overflow-y:auto;max-height:420px;padding:0 20px 16px">
       <table id="st-preview-table" style="font-size:12px">
@@ -1170,6 +1179,7 @@ tr.brand-row td{background:#fefce8!important}
           <th>Ad group</th>
           <th>Target type</th>
           <th>Account</th>
+          <th>Bid ₹</th>
         </tr></thead>
         <tbody id="st-preview-body"></tbody>
       </table>
@@ -1820,15 +1830,24 @@ function showStPreview() {
   // Sync main tab bid/budget into modal inputs so Rajesh can adjust before confirming
   document.getElementById('st-modal-bid').value    = document.getElementById('st-bid').value || 5;
   document.getElementById('st-modal-budget').value = document.getElementById('st-budget').value || 100;
+  const globalBid = parseFloat(document.getElementById('st-modal-bid').value) || 5;
   const rows = selected.map(a => `<tr>
     <td class="mono" style="font-weight:700">${a.asin}</td>
     <td style="font-size:11px">SP|Self-Target|${a.asin}</td>
     <td style="font-size:11px">Self|${a.asin}</td>
     <td style="font-size:11px;color:#2563eb">asinSameAs</td>
     <td style="font-size:11px;color:#64748b">${a.profileLabel}</td>
+    <td><input type="number" class="st-row-bid" data-asin="${a.asin}" value="${globalBid}"
+               min="1" max="9999" step="0.5"
+               style="width:72px;padding:4px 6px;border:1px solid var(--b);border-radius:5px;font-size:12px;font-weight:700"></td>
   </tr>`).join('');
   document.getElementById('st-preview-body').innerHTML = rows;
   document.getElementById('st-modal').classList.add('open');
+}
+
+function stApplyBidToAll() {
+  const bid = parseFloat(document.getElementById('st-modal-bid').value) || 5;
+  document.querySelectorAll('.st-row-bid').forEach(inp => inp.value = bid);
 }
 
 function closeStModal(e) {
@@ -1839,9 +1858,13 @@ function closeStModal(e) {
 async function createSelfTargets() {
   const selected = stAsins.filter(a => a.checked);
   if (!selected.length) return;
-  // Read from modal inputs (Rajesh may have changed them before confirming)
-  const bid    = parseFloat(document.getElementById('st-modal-bid').value) || 5;
   const budget = parseFloat(document.getElementById('st-modal-budget').value) || 100;
+  // Collect per-ASIN bids from the row inputs; fall back to global bid if missing
+  const globalBid = parseFloat(document.getElementById('st-modal-bid').value) || 5;
+  const rowBids = {};
+  document.querySelectorAll('.st-row-bid').forEach(inp => {
+    rowBids[inp.dataset.asin] = parseFloat(inp.value) || globalBid;
+  });
 
   const btn = document.getElementById('st-confirm-btn');
   btn.disabled = true;
@@ -1852,8 +1875,8 @@ async function createSelfTargets() {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
-        items: selected.map(a => ({asin: a.asin, profile: a.profile})),
-        bid, daily_budget: budget
+        items: selected.map(a => ({asin: a.asin, profile: a.profile, bid: rowBids[a.asin] || globalBid})),
+        bid: globalBid, daily_budget: budget
       })
     });
     const d = await r.json();
