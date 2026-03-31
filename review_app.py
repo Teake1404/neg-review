@@ -770,7 +770,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, b
                                  "startDate": today_str}]},
             timeout=30)
         if r.status_code >= 400:
-            results["errors"].append({"asin": asin, "step": "campaign", "msg": r.text[:200]})
+            results["errors"].append({"asin": asin, "step": "campaign", "msg": r.text[:500]})
             continue
         camp = r.json().get("campaigns", {})
         ok   = camp.get("success", [])
@@ -789,7 +789,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, b
                                 "defaultBid": asin_bid, "state": "ENABLED"}]},
             timeout=30)
         if r.status_code >= 400:
-            results["errors"].append({"asin": asin, "step": "adGroup", "msg": r.text[:200]})
+            results["errors"].append({"asin": asin, "step": "adGroup", "msg": r.text[:500]})
             continue
         ag  = r.json().get("adGroups", {})
         aok = ag.get("success", [])
@@ -808,7 +808,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, b
                                   "asin": asin, "state": "ENABLED"}]},
             timeout=30)
         if r.status_code >= 400:
-            results["errors"].append({"asin": asin, "step": "productAd", "msg": r.text[:200]})
+            results["errors"].append({"asin": asin, "step": "productAd", "msg": r.text[:500]})
             continue
 
         # Step 4: asinSameAs target
@@ -823,7 +823,7 @@ def _create_self_target_campaigns(token, profile_id, asins, bid, daily_budget, b
                                         "expressionType": "MANUAL"}]},
             timeout=30)
         if r.status_code >= 400:
-            results["errors"].append({"asin": asin, "step": "target", "msg": r.text[:200]})
+            results["errors"].append({"asin": asin, "step": "target", "msg": r.text[:500]})
             continue
         tgt = r.json().get("targetingClauses", {})
         if tgt.get("error"):
@@ -1693,11 +1693,11 @@ async function loadData(force=false) {
   }
 }
 
-function showToast(msg) {
+function showToast(msg, ms) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.style.display = 'block';
-  setTimeout(() => t.style.display = 'none', 5000);
+  setTimeout(() => t.style.display = 'none', ms || 5000);
 }
 
 function escHtml(s) {
@@ -1880,19 +1880,24 @@ async function createSelfTargets() {
       })
     });
     const d = await r.json();
-    document.getElementById('st-modal').classList.remove('open');
 
-    if (d.errors > 0)
-      showToast(`⚠️ ${d.created} created, ${d.errors} failed. Check console for details.`);
-    else
+    if (d.errors > 0) {
+      // Build a readable error from the first failed item
+      const firstErr = (d.detail.errors || [])[0] || {};
+      const errMsg = firstErr.msg || JSON.stringify(firstErr);
+      const step   = firstErr.step ? ` (step: ${firstErr.step})` : '';
+      showToast(`⚠️ ${d.created} created, ${d.errors} failed${step}: ${errMsg}`, 8000);
+    } else {
+      document.getElementById('st-modal').classList.remove('open');
       showToast(`✅ ${d.created} self-targeting campaign(s) created!`);
+    }
 
     // Uncheck successfully created ASINs
     const done = new Set((d.detail.success || []).map(s => s.asin));
     stAsins.forEach(a => { if (done.has(a.asin)) a.checked = false; });
     renderStTable();
   } catch(e) {
-    showToast('❌ Error: ' + e.message);
+    showToast('❌ Error: ' + e.message, 8000);
   }
   btn.disabled = false;
   btn.textContent = '🎯 Create Campaigns';
