@@ -863,6 +863,18 @@ def api_self_target_asins():
     else:
         errors.append("No winner pairs in cache — showing all enabled product ads.")
 
+    # Exclude ASINs already running in a self-targeting campaign.
+    # Matches: "SP|Self-Target|..." (our format) and "Self PT ..." (existing experiments).
+    def _is_self_targeting(name):
+        n = (name or "").lower()
+        return n.startswith("sp|self-target|") or "self pt" in n
+
+    pre_filter = len(all_ads)
+    all_ads = [ad for ad in all_ads if not _is_self_targeting(ad.get("campaignName", ""))]
+    excluded = pre_filter - len(all_ads)
+    if excluded:
+        errors.append(f"Excluded {excluded} product ads already in self-targeting campaigns.")
+
     seen, unique = set(), []
     for ad in all_ads:
         key = (ad["profile"], ad.get("asin", ""))
