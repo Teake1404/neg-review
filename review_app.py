@@ -618,11 +618,26 @@ def api_apply():
                     "keywordText": t["searchTerm"], "matchType": "NEGATIVE_EXACT",
                     "state": "ENABLED"} for t in terms]
         for i in range(0, len(payload), 1000):
-            r = requests.post(f"{EU_API}/sp/negativeKeywords",
-                              headers=headers, json={"negativeKeywords": payload[i:i+1000]})
+            chunk = payload[i:i+1000]
+            r  = requests.post(f"{EU_API}/sp/negativeKeywords",
+                               headers=headers, json={"negativeKeywords": chunk})
             rd = r.json()
             results["success"].extend(rd.get("negativeKeywords", {}).get("success", []))
-            results["errors"].extend(rd.get("negativeKeywords", {}).get("error", []))
+            # Flatten nested error structure and attach original keyword text via index
+            for err in rd.get("negativeKeywords", {}).get("error", []):
+                idx      = err.get("index", 0)
+                kw_text  = chunk[idx]["keywordText"] if idx < len(chunk) else ""
+                inner    = (err.get("errors") or [{}])[0]
+                err_type = inner.get("errorType", "")
+                err_val  = inner.get("errorValue", {})
+                # errorValue is usually {"errorType": {"message": "...", "reason": "..."}}
+                detail   = next(iter(err_val.values()), {}) if isinstance(err_val, dict) else {}
+                message  = detail.get("message") or str(inner)
+                results["errors"].append({
+                    "keywordText": kw_text,
+                    "errorType":   err_type,
+                    "description": message,
+                })
 
     added  = len(results["success"])
     errors = len(results["errors"])
@@ -2374,3 +2389,4 @@ if __name__ == "__main__":
     print("\n🚀 Menhood Ads Review App")
     print("   Open: http://localhost:5050\n")
     app.run(port=5050, debug=False)
+
