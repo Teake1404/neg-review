@@ -2255,9 +2255,9 @@ async function createSelfTargets() {
       showToast(`✅ ${d.created} self-targeting campaign(s) created!`);
     }
 
-    // Uncheck successfully created ASINs
+    // Remove successfully created ASINs from the list so they don't reappear
     const done = new Set((d.detail.success || []).map(s => s.asin));
-    stAsins.forEach(a => { if (done.has(a.asin)) a.checked = false; });
+    stAsins = stAsins.filter(a => !done.has(a.asin));
     renderStTable();
   } catch(e) {
     showToast('❌ Error: ' + e.message, 8000);
