@@ -1780,11 +1780,33 @@ async function applyNegatives() {
     body: JSON.stringify({terms: selected, dry_run: false})
   });
   const d = await r.json();
-  showToast(d.status === 'applied'
-    ? `✅ ${d.added} negatives added successfully!`
-    : `❌ Error: ${JSON.stringify(d)}`);
+
+  if (d.status === 'applied' && d.added > 0) {
+    // Build set of failed term keys so we keep them in the list
+    const errored = new Set(
+      (d.detail?.errors || []).map(e => `${e.campaignId}|${e.adGroupId}|${e.keywordText}`)
+    );
+    const appliedIds = new Set(
+      selected
+        .filter(t => !errored.has(`${t.campaignId}|${t.adGroupId}|${t.searchTerm}`))
+        .map(t => t.id)
+    );
+    // Remove from allTerms so ALL counts + stats update immediately
+    allTerms = allTerms.filter(t => !appliedIds.has(t.id));
+    // Clear checked state for removed terms
+    appliedIds.forEach(id => delete negChecked[id]);
+    splitTerms();
+    updateKPIs();
+    renderNegTable();
+    showToast(d.errors > 0
+      ? `✅ ${d.added} negatives added · ⚠️ ${d.errors} failed (see email for details)`
+      : `✅ ${d.added} negatives added successfully!`);
+  } else {
+    showToast(`❌ Error: ${JSON.stringify(d)}`);
+  }
+
   btn.textContent = '🚫 Apply Negatives';
-  btn.disabled = selected.length === 0;
+  btn.disabled = negTerms.filter(t => negChecked[t.id]).length === 0;
 }
 
 // ── WINNERS TABLE ──────────────────────────────────────────────────────────
@@ -1928,10 +1950,19 @@ async function confirmCreateKeywords() {
     });
     const d = await r.json();
     document.getElementById('bid-modal').classList.remove('open');
-    if (d.errors > 0) {
-      showToast(`⚠️ ${d.added} created · ${d.errors} errors`);
+
+    if (d.added > 0) {
+      // Remove scaled winners from allTerms so counts + stats update immediately
+      const scaledIds = new Set(selected.map(t => t.id));
+      allTerms = allTerms.filter(t => !scaledIds.has(t.id));
+      splitTerms();
+      updateKPIs();
+      renderWinTable();
+      showToast(d.errors > 0
+        ? `⚠️ ${d.added} keywords created · ${d.errors} errors`
+        : `✅ ${d.added} exact keywords created!`);
     } else {
-      showToast(`✅ ${d.added} exact keywords created!`);
+      showToast(`⚠️ ${d.errors} errors — no keywords created`);
     }
   } catch(e) {
     showToast('❌ Error: ' + e.message);
