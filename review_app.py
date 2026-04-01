@@ -27,6 +27,7 @@ EU_API    = "https://advertising-api-eu.amazon.com"
 MIN_SPEND = 50    # ₹ — minimum spend to surface a term
 
 IST = timezone(timedelta(hours=5, minutes=30))
+_placement_undo_log = []   # [{id, ts, label, changes: [{...before, after}]}]
 
 def date_range_30d():
     """Return (start, end) as a rolling 30-day window ending yesterday in IST.
@@ -959,6 +960,194 @@ def api_self_target_create():
                                                            "errors": all_errors}})
 
 
+# ── PLACEMENTS ────────────────────────────────────────────────────────────────
+
+_PLACEMENT_KEYS = ["PLACEMENT_TOP", "PLACEMENT_REST_OF_SEARCH", "PLACEMENT_PRODUCT_PAGE"]
+_PLACEMENT_LABELS = {
+    "PLACEMENT_TOP":              "Top of Search",
+    "PLACEMENT_REST_OF_SEARCH":   "Rest of Search",
+    "PLACEMENT_PRODUCT_PAGE":     "Product Pages",
+}
+
+
+def _fetch_placements_for_profile(token, profile_id, label):
+    headers = {
+        "Amazon-Advertising-API-ClientId": CLIENT_ID,
+        "Amazon-Advertising-API-Scope":    profile_id,
+        "Authorization":                   f"Bearer {token}",
+        "Content-Type": "application/vnd.spCampaign.v3+json",
+        "Accept":       "application/vnd.spCampaign.v3+json",
+    }
+    campaigns, nt = [], None
+    while True:
+        body = {"stateFilter": {"include": ["ENABLED", "PAUSED"]},
+                "include": ["bidding"]}
+        if nt:
+            body["nextToken"] = nt
+        r = requests.post(f"{EU_API}/sp/campaigns/list", headers=headers, json=body, timeout=30)
+        if r.status_code >= 400:
+            print(f"Placements fetch [{profile_id}] {r.status_code}: {r.text[:200]}", flush=True)
+            break
+        data = r.json()
+        for c in data.get("campaigns", []):
+            adj = {a["predicate"]: a["percentage"]
+                   for a in (c.get("bidding") or {}).get("adjustments", [])}
+            campaigns.append({
+                "campaignId":   str(c["campaignId"]),
+                "campaignName": c.get("name", ""),
+                "state":        c.get("state", ""),
+                "strategy":     (c.get("bidding") or {}).get("strategy", ""),
+                "profile":      profile_id,
+                "profileLabel": label,
+                "top":          adj.get("PLACEMENT_TOP", 0),
+                "rest":         adj.get("PLACEMENT_REST_OF_SEARCH", 0),
+                "product":      adj.get("PLACEMENT_PRODUCT_PAGE", 0),
+            })
+        nt = data.get("nextToken")
+        if not nt:
+            break
+    return campaigns
+
+
+@app.route("/api/placements")
+def api_placements():
+    try:
+        token = get_token()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    all_camps = []
+    for pid, label in PROFILES.items():
+        all_camps.extend(_fetch_placements_for_profile(token, pid, label))
+    all_camps.sort(key=lambda c: c["campaignName"])
+    return jsonify({"campaigns": all_camps, "undoLog": _placement_undo_log[-20:]})
+
+
+@app.route("/api/placements/update", methods=["POST"])
+def api_placements_update():
+    global _placement_undo_log
+    data    = request.json
+    updates = data.get("updates", [])   # [{campaignId, profile, top, rest, product}]
+    label   = data.get("label", "Bulk update")
+    if not updates:
+        return jsonify({"error": "No updates provided"}), 400
+    try:
+        token = get_token()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    by_profile = {}
+    for u in updates:
+        by_profile.setdefault(u["profile"], []).append(u)
+
+    all_success, all_errors, undo_changes = [], [], []
+
+    for pid, items in by_profile.items():
+        headers = {
+            "Amazon-Advertising-API-ClientId": CLIENT_ID,
+            "Amazon-Advertising-API-Scope":    pid,
+            "Authorization":                   f"Bearer {token}",
+            "Content-Type": "application/vnd.spCampaign.v3+json",
+            "Accept":       "application/vnd.spCampaign.v3+json",
+        }
+        payload = []
+        for item in items:
+            adjs = []
+            for key, field in [("PLACEMENT_TOP","top"),
+                                ("PLACEMENT_REST_OF_SEARCH","rest"),
+                                ("PLACEMENT_PRODUCT_PAGE","product")]:
+                if item.get(field) is not None:
+                    adjs.append({"predicate": key, "percentage": int(item[field])})
+            payload.append({"campaignId": item["campaignId"],
+                            "bidding": {"adjustments": adjs}})
+            undo_changes.append({
+                "campaignId":   item["campaignId"],
+                "campaignName": item.get("campaignName", ""),
+                "profile":      pid,
+                "before": {"top": item.get("beforeTop"), "rest": item.get("beforeRest"),
+                           "product": item.get("beforeProduct")},
+                "after":  {"top": item.get("top"), "rest": item.get("rest"),
+                           "product": item.get("product")},
+            })
+
+        for i in range(0, len(payload), 100):
+            r = requests.put(f"{EU_API}/sp/campaigns",
+                             headers=headers,
+                             json={"campaigns": payload[i:i+100]},
+                             timeout=30)
+            if r.status_code >= 400:
+                all_errors.append({"profile": pid, "msg": r.text[:200]})
+                continue
+            rd = r.json()
+            all_success.extend(rd.get("campaigns", {}).get("success", []))
+            all_errors.extend(rd.get("campaigns", {}).get("error", []))
+
+    if all_success:
+        import uuid
+        _placement_undo_log.append({
+            "id":      str(uuid.uuid4())[:8],
+            "ts":      datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST"),
+            "label":   label,
+            "changes": undo_changes,
+        })
+        _placement_undo_log = _placement_undo_log[-50:]  # keep last 50 batches
+
+    return jsonify({"updated": len(all_success), "errors": len(all_errors),
+                    "errorDetail": all_errors})
+
+
+@app.route("/api/placements/undo", methods=["POST"])
+def api_placements_undo():
+    global _placement_undo_log
+    batch_id = request.json.get("id")
+    batch = next((b for b in _placement_undo_log if b["id"] == batch_id), None)
+    if not batch:
+        return jsonify({"error": "Undo batch not found"}), 404
+    try:
+        token = get_token()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    by_profile = {}
+    for ch in batch["changes"]:
+        by_profile.setdefault(ch["profile"], []).append(ch)
+
+    all_success, all_errors = [], []
+    for pid, items in by_profile.items():
+        headers = {
+            "Amazon-Advertising-API-ClientId": CLIENT_ID,
+            "Amazon-Advertising-API-Scope":    pid,
+            "Authorization":                   f"Bearer {token}",
+            "Content-Type": "application/vnd.spCampaign.v3+json",
+            "Accept":       "application/vnd.spCampaign.v3+json",
+        }
+        payload = []
+        for item in items:
+            before = item.get("before", {})
+            adjs = []
+            for key, field in [("PLACEMENT_TOP","top"),
+                                ("PLACEMENT_REST_OF_SEARCH","rest"),
+                                ("PLACEMENT_PRODUCT_PAGE","product")]:
+                if before.get(field) is not None:
+                    adjs.append({"predicate": key, "percentage": int(before[field])})
+            payload.append({"campaignId": item["campaignId"],
+                            "bidding": {"adjustments": adjs}})
+        r = requests.put(f"{EU_API}/sp/campaigns",
+                         headers=headers,
+                         json={"campaigns": payload},
+                         timeout=30)
+        if r.status_code >= 400:
+            all_errors.append(r.text[:200])
+        else:
+            rd = r.json()
+            all_success.extend(rd.get("campaigns", {}).get("success", []))
+            all_errors.extend(rd.get("campaigns", {}).get("error", []))
+
+    if not all_errors:
+        _placement_undo_log = [b for b in _placement_undo_log if b["id"] != batch_id]
+
+    return jsonify({"reverted": len(all_success), "errors": len(all_errors)})
+
+
 # ── HTML TEMPLATE ──────────────────────────────────────────────────────────────
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -1094,6 +1283,7 @@ tr.brand-row td{background:#fefce8!important}
   <button class="tab-btn active" onclick="switchTab(1,this)" id="tab-btn-1">🚫 Negative Review <span id="tab1-count"></span></button>
   <button class="tab-btn" onclick="switchTab(2,this)" id="tab-btn-2">🚀 Scale Winners <span id="tab2-count"></span></button>
   <button class="tab-btn" onclick="switchTab(3,this)" id="tab-btn-3">🎯 Self-Target</button>
+  <button class="tab-btn" onclick="switchTab(4,this)" id="tab-btn-4">📊 Placements</button>
 </div>
 
 <!-- TAB 1: NEGATIVE REVIEW -->
@@ -1173,6 +1363,50 @@ tr.brand-row td{background:#fefce8!important}
 
   <div id="st-table-container">
     <div class="loading"><span class="spinner"></span>Loading ASINs…</div>
+  </div>
+</div>
+
+<!-- TAB 4: PLACEMENTS -->
+<div class="tab-panel" id="tab-4">
+  <div class="winners-controls" style="flex-wrap:wrap;gap:10px;align-items:flex-end">
+    <div class="bid-wrap">
+      <label>Top of Search %</label>
+      <input type="number" id="pl-top" placeholder="—" min="0" max="900" step="1"
+             style="width:80px;padding:6px 8px;border:1px solid var(--b);border-radius:6px;font-size:13px">
+    </div>
+    <div class="bid-wrap">
+      <label>Rest of Search %</label>
+      <input type="number" id="pl-rest" placeholder="—" min="0" max="900" step="1"
+             style="width:80px;padding:6px 8px;border:1px solid var(--b);border-radius:6px;font-size:13px">
+    </div>
+    <div class="bid-wrap">
+      <label>Product Pages %</label>
+      <input type="number" id="pl-product" placeholder="—" min="0" max="900" step="1"
+             style="width:80px;padding:6px 8px;border:1px solid var(--b);border-radius:6px;font-size:13px">
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn btn-ghost" onclick="plToggleAll(true)">✅ Select All</button>
+      <button class="btn btn-ghost" onclick="plToggleAll(false)">☐ Deselect</button>
+      <button class="btn btn-ghost" onclick="loadPlacements()">🔄 Refresh</button>
+      <button class="btn btn-primary" id="pl-apply-btn" onclick="applyPlacements()" disabled>
+        💾 Apply Changes
+      </button>
+    </div>
+    <div id="pl-search-wrap">
+      <input type="text" id="pl-search" placeholder="Filter campaigns…"
+             oninput="renderPlTable()"
+             style="padding:6px 10px;border:1px solid var(--b);border-radius:6px;font-size:13px;width:200px">
+    </div>
+  </div>
+
+  <div id="pl-table-container">
+    <div class="loading"><span class="spinner"></span>Loading placements…</div>
+  </div>
+
+  <!-- Undo log -->
+  <div id="pl-undo-section" style="display:none;margin-top:24px">
+    <h3 style="font-size:13px;font-weight:700;color:#374151;margin-bottom:10px">⏪ Change History (selective undo)</h3>
+    <div id="pl-undo-list"></div>
   </div>
 </div>
 
@@ -1640,12 +1874,14 @@ function exportWinnersCSV() {
 
 // ── TAB SWITCHING ──────────────────────────────────────────────────────────
 let stLoaded = false;
+let plLoaded = false;
 function switchTab(n, btn) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + n).classList.add('active');
   btn.classList.add('active');
   if (n === 3 && !stLoaded) { stLoaded = true; loadSelfTargetAsins(); }
+  if (n === 4 && !plLoaded) { plLoaded = true; loadPlacements(); }
 }
 
 // ── DATA LOADING ───────────────────────────────────────────────────────────
@@ -1936,6 +2172,169 @@ async function createSelfTargets() {
   }
   btn.disabled = false;
   btn.textContent = '🎯 Create Campaigns';
+}
+
+// ── PLACEMENTS TAB ──────────────────────────────────────────────────────────
+let plCampaigns = [];   // full list from server
+let plFiltered  = [];   // after search filter
+
+async function loadPlacements() {
+  document.getElementById('pl-table-container').innerHTML =
+    '<div class="loading"><span class="spinner"></span>Loading placements…</div>';
+  try {
+    const d = await fetch('/api/placements').then(r => r.json());
+    plCampaigns = (d.campaigns || []).map(c => ({...c, checked: false}));
+    renderPlTable();
+    renderUndoLog(d.undoLog || []);
+  } catch(e) {
+    document.getElementById('pl-table-container').innerHTML =
+      `<p style="color:red;padding:16px">Error: ${e.message}</p>`;
+  }
+}
+
+function renderPlTable() {
+  const q = (document.getElementById('pl-search')?.value || '').toLowerCase();
+  plFiltered = plCampaigns.filter(c =>
+    !q || c.campaignName.toLowerCase().includes(q) || c.profileLabel.toLowerCase().includes(q)
+  );
+
+  if (!plFiltered.length) {
+    document.getElementById('pl-table-container').innerHTML =
+      '<p style="color:#64748b;padding:16px">No campaigns found.</p>';
+    document.getElementById('pl-apply-btn').disabled = true;
+    return;
+  }
+
+  const stratLabel = s => s
+    ? s.replace('DYNAMIC_BIDS_','').replace(/_/g,' ').toLowerCase()
+        .replace(/\b\w/g,c=>c.toUpperCase())
+    : '—';
+
+  let rows = plFiltered.map((c,i) => `
+    <tr style="background:${i%2===0?'#fff':'#f9fafb'}">
+      <td style="padding:7px 10px"><input type="checkbox" ${c.checked?'checked':''} onchange="plToggle(${plCampaigns.indexOf(c)},this.checked)"></td>
+      <td style="padding:7px 10px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${c.campaignName}">${c.campaignName}</td>
+      <td style="padding:7px 10px;font-size:11px;color:#64748b">${c.profileLabel}</td>
+      <td style="padding:7px 10px;font-size:11px">${stratLabel(c.strategy)}</td>
+      <td style="padding:7px 10px;text-align:center;font-weight:700;color:${c.top>0?'#2563eb':'#94a3b8'}">${c.top}%</td>
+      <td style="padding:7px 10px;text-align:center;font-weight:700;color:${c.rest>0?'#2563eb':'#94a3b8'}">${c.rest}%</td>
+      <td style="padding:7px 10px;text-align:center;font-weight:700;color:${c.product>0?'#2563eb':'#94a3b8'}">${c.product}%</td>
+    </tr>`).join('');
+
+  document.getElementById('pl-table-container').innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead>
+        <tr style="background:#0f172a;color:#fff">
+          <th style="padding:8px 10px;width:32px"><input type="checkbox" onchange="plToggleAll(this.checked)" id="pl-check-all"></th>
+          <th style="padding:8px 10px;text-align:left">Campaign</th>
+          <th style="padding:8px 10px;text-align:left">Account</th>
+          <th style="padding:8px 10px;text-align:left">Bid Strategy</th>
+          <th style="padding:8px 10px;text-align:center">Top of Search %</th>
+          <th style="padding:8px 10px;text-align:center">Rest of Search %</th>
+          <th style="padding:8px 10px;text-align:center">Product Pages %</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p style="font-size:11px;color:#94a3b8;margin-top:8px">${plFiltered.length} campaigns · leave a field blank to keep current value</p>`;
+  updatePlApplyBtn();
+}
+
+function plToggle(idx, val) {
+  plCampaigns[idx].checked = val;
+  updatePlApplyBtn();
+}
+
+function plToggleAll(val) {
+  plFiltered.forEach(c => { c.checked = val; });
+  renderPlTable();
+}
+
+function updatePlApplyBtn() {
+  const anyChecked = plCampaigns.some(c => c.checked);
+  document.getElementById('pl-apply-btn').disabled = !anyChecked;
+}
+
+async function applyPlacements() {
+  const top     = document.getElementById('pl-top').value;
+  const rest    = document.getElementById('pl-rest').value;
+  const product = document.getElementById('pl-product').value;
+
+  if (top === '' && rest === '' && product === '') {
+    showToast('Enter at least one placement % to apply.', 5000); return;
+  }
+
+  const selected = plCampaigns.filter(c => c.checked);
+  if (!selected.length) { showToast('Select at least one campaign.', 4000); return; }
+
+  const btn = document.getElementById('pl-apply-btn');
+  btn.disabled = true; btn.textContent = '⏳ Applying…';
+
+  const updates = selected.map(c => ({
+    campaignId:   c.campaignId,
+    campaignName: c.campaignName,
+    profile:      c.profile,
+    beforeTop:    c.top,  beforeRest: c.rest,  beforeProduct: c.product,
+    top:     top     !== '' ? parseInt(top)     : c.top,
+    rest:    rest    !== '' ? parseInt(rest)    : c.rest,
+    product: product !== '' ? parseInt(product) : c.product,
+  }));
+
+  const label = `Set ${[top!==''?`Top=${top}%`:'', rest!==''?`Rest=${rest}%`:'', product!==''?`Pages=${product}%`:''].filter(Boolean).join(', ')} on ${selected.length} campaigns`;
+
+  try {
+    const d = await fetch('/api/placements/update', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({updates, label})
+    }).then(r => r.json());
+
+    if (d.errors > 0)
+      showToast(`⚠️ ${d.updated} updated, ${d.errors} failed.`, 8000);
+    else
+      showToast(`✅ ${d.updated} campaigns updated!`, 5000);
+
+    await loadPlacements();
+  } catch(e) {
+    showToast('❌ ' + e.message, 8000);
+  }
+  btn.disabled = false; btn.textContent = '💾 Apply Changes';
+}
+
+function renderUndoLog(log) {
+  const sec  = document.getElementById('pl-undo-section');
+  const list = document.getElementById('pl-undo-list');
+  if (!log.length) { sec.style.display = 'none'; return; }
+  sec.style.display = 'block';
+  list.innerHTML = log.slice().reverse().map(b => `
+    <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:12px 16px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <div>
+        <span style="font-size:12px;font-weight:700">${b.label}</span>
+        <span style="font-size:11px;color:#6b7280;margin-left:10px">${b.ts}</span>
+        <span style="font-size:11px;color:#94a3b8;margin-left:6px">(${b.changes.length} campaigns)</span>
+      </div>
+      <button class="btn btn-ghost" style="font-size:11px;padding:5px 12px" onclick="undoBatch('${b.id}',this)">
+        ⏪ Undo this
+      </button>
+    </div>`).join('');
+}
+
+async function undoBatch(id, btn) {
+  if (!confirm('Revert these placement changes?')) return;
+  btn.disabled = true; btn.textContent = '⏳ Reverting…';
+  try {
+    const d = await fetch('/api/placements/undo', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({id})
+    }).then(r => r.json());
+    showToast(d.errors > 0 ? `⚠️ ${d.reverted} reverted, ${d.errors} failed.`
+                           : `✅ ${d.reverted} campaigns reverted.`, 5000);
+    await loadPlacements();
+  } catch(e) {
+    showToast('❌ ' + e.message, 8000);
+    btn.disabled = false; btn.textContent = '⏪ Undo this';
+  }
 }
 </script>
 </body>
