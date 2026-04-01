@@ -497,10 +497,42 @@ def send_email_notification(subject: str, html_body: str):
         print(f"EMAIL ERROR: {e}", flush=True)
 
 
-def _build_negatives_email(approved: list, added: int, errors: int) -> str:
+def _build_errors_section(error_list: list) -> str:
+    """Build HTML errors table for the email, or empty string if no errors."""
+    if not error_list:
+        return ""
+    rows = ""
+    for e in error_list:
+        kw      = e.get("keywordText") or e.get("keyword", {}).get("keywordText", "")
+        code    = e.get("errorType") or e.get("code", "")
+        message = e.get("description") or e.get("message", str(e))
+        rows += f"""
+        <tr>
+          <td style="padding:6px 10px;border-bottom:1px solid #fee2e2;">{kw}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #fee2e2;color:#dc2626;">{code}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #fee2e2;color:#6b7280;">{message[:120]}</td>
+        </tr>"""
+    return f"""
+        <div style="margin-top:24px;">
+          <h3 style="font-size:14px;font-weight:700;color:#dc2626;margin-bottom:12px;">⚠️ {len(error_list)} Errors</h3>
+          <table style="width:100%;border-collapse:collapse;font-size:12px;">
+            <thead>
+              <tr style="background:#fee2e2;color:#7f1d1d;">
+                <th style="padding:8px 10px;text-align:left;">Keyword</th>
+                <th style="padding:8px 10px;text-align:left;">Error Code</th>
+                <th style="padding:8px 10px;text-align:left;">Reason</th>
+              </tr>
+            </thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>"""
+
+
+def _build_negatives_email(approved: list, added: int, error_list: list) -> str:
     """Build HTML email summary for applied negatives."""
     now_ist     = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
     total_spend = sum(float(t.get("spend", 0)) for t in approved)
+    errors      = len(error_list)
 
     rows = ""
     for t in approved[:50]:
@@ -548,6 +580,7 @@ def _build_negatives_email(approved: list, added: int, errors: int) -> str:
           <tbody>{rows}</tbody>
         </table>
         {more}
+        {_build_errors_section(error_list)}
       </div>
       <div style="background:#f9fafb;border:1px solid #e5e7eb;border-top:0;padding:16px 40px;border-radius:0 0 12px 12px;">
         <p style="color:#9ca3af;font-size:12px;margin:0;">
@@ -595,7 +628,7 @@ def api_apply():
 
     if added > 0:
         subject   = f"🚫 {added} negatives applied — ₹{sum(float(t.get('spend',0)) for t in approved):,.0f} spend stopped"
-        html_body = _build_negatives_email(approved, added, errors)
+        html_body = _build_negatives_email(approved, added, results["errors"])
         threading.Thread(target=send_email_notification, args=(subject, html_body),
                          daemon=True).start()
 
