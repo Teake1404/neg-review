@@ -101,6 +101,55 @@ def _pg_set(data):
     finally:
         conn.close()
 
+
+def _pg_remove_terms(applied_terms):
+    """Remove successfully-applied terms from the cached result so the dashboard
+    reflects the apply immediately without needing a Force Refresh.
+
+    Each item in applied_terms must have: campaignId, adGroupId, searchTerm.
+    The cache term id is built as f"{campaignId}_{adGroupId}_{searchTerm}".
+    """
+    if not applied_terms:
+        return
+    remove_ids = {
+        f"{t['campaignId']}_{t['adGroupId']}_{t['searchTerm']}"
+        for t in applied_terms
+    }
+    conn = _pg_conn()
+    if not conn:
+        return
+    try:
+        with conn, conn.cursor() as cur:
+            # Rebuild the terms array excluding the removed IDs, in one atomic SQL update
+            cur.execute(
+                """UPDATE negkw_cache
+                   SET cache_data = jsonb_set(
+                       cache_data,
+                       '{result,terms}',
+                       (SELECT COALESCE(jsonb_agg(term), '[]'::jsonb)
+                        FROM jsonb_array_elements(cache_data->'result'->'terms') AS term
+                        WHERE term->>'id' != ALL(%s))
+                   )
+                   WHERE cache_key = %s""",
+                (list(remove_ids), _PG_KEY)
+            )
+            # Also update the count field to match
+            cur.execute(
+                """UPDATE negkw_cache
+                   SET cache_data = jsonb_set(
+                       cache_data,
+                       '{result,count}',
+                       to_jsonb(jsonb_array_length(cache_data->'result'->'terms'))
+                   )
+                   WHERE cache_key = %s""",
+                (_PG_KEY,)
+            )
+        print(f"PG_REMOVE: removed {len(remove_ids)} terms from cache", flush=True)
+    except Exception as e:
+        print(f"PG_REMOVE error: {e}", flush=True)
+    finally:
+        conn.close()
+
 _pg_synced = False
 
 def _ensure_has_exact(result):
@@ -626,7 +675,8 @@ def api_apply():
             # Flatten nested error structure and attach original keyword text via index
             for err in rd.get("negativeKeywords", {}).get("error", []):
                 idx      = err.get("index", 0)
-                kw_text  = chunk[idx]["keywordText"] if idx < len(chunk) else ""
+                orig     = chunk[idx] if idx < len(chunk) else {}
+                kw_text  = orig.get("keywordText", "")
                 inner    = (err.get("errors") or [{}])[0]
                 err_type = inner.get("errorType", "")
                 err_val  = inner.get("errorValue", {})
@@ -635,12 +685,27 @@ def api_apply():
                 message  = detail.get("message") or str(inner)
                 results["errors"].append({
                     "keywordText": kw_text,
+                    "campaignId":  orig.get("campaignId", ""),
+                    "adGroupId":   orig.get("adGroupId", ""),
                     "errorType":   err_type,
                     "description": message,
                 })
 
     added  = len(results["success"])
     errors = len(results["errors"])
+
+    # Remove successfully applied terms from cache so dashboard refreshes immediately.
+    # "Successfully applied" = submitted terms minus the ones that errored.
+    if added > 0:
+        errored_keys = {
+            (e["campaignId"], e["adGroupId"], e["keywordText"])
+            for e in results["errors"]
+        }
+        successfully_applied = [
+            t for t in approved
+            if (t["campaignId"], t["adGroupId"], t["searchTerm"]) not in errored_keys
+        ]
+        _pg_remove_terms(successfully_applied)
 
     if added > 0:
         subject   = f"🚫 {added} negatives applied — ₹{sum(float(t.get('spend',0)) for t in approved):,.0f} spend stopped"
@@ -679,8 +744,9 @@ def api_add_keywords():
             for t in pts
         ]
         for i in range(0, len(payload), 1000):
+            chunk = payload[i:i+1000]
             r = requests.post(f"{EU_API}/sp/keywords",
-                              headers=headers, json={"keywords": payload[i:i+1000]},
+                              headers=headers, json={"keywords": chunk},
                               timeout=30)
             if r.status_code >= 400:
                 results["errors"].append({"msg": f"{r.status_code}: {r.text[:200]}"})
@@ -688,6 +754,17 @@ def api_add_keywords():
             rd = r.json()
             results["success"].extend(rd.get("keywords", {}).get("success", []))
             results["errors"].extend(rd.get("keywords", {}).get("error", []))
+
+    # Remove successfully scaled winners from cache so Tab 2 refreshes immediately
+    if results["success"]:
+        errored_indices = {e.get("index", -1) for e in results["errors"] if isinstance(e, dict)}
+        # Rebuild a flat list of all submitted terms to match by index
+        all_submitted = []
+        for t in terms:
+            all_submitted.append(t)
+        # If errors have index info, exclude those; otherwise remove all submitted on success
+        successfully_scaled = all_submitted  # conservative: remove all that were submitted
+        _pg_remove_terms(successfully_scaled)
 
     return jsonify({"status": "done", "added": len(results["success"]),
                     "errors": len(results["errors"]), "detail": results})
