@@ -1063,6 +1063,79 @@ _PLACEMENT_LABELS = {
 }
 
 
+def _fetch_placement_spend_for_profile(token, profile_id):
+    """Fetch 30-day spend/clicks/orders broken down by placement for one profile.
+    Returns {TOP: {spend,clicks,orders,sales}, REST: {...}, PRODUCT: {...}}
+    """
+    start, end = date_range_30d()
+    headers = {
+        "Amazon-Advertising-API-ClientId": CLIENT_ID,
+        "Amazon-Advertising-API-Scope":    profile_id,
+        "Authorization":                   f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "name": f"PlacementSpend {start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}",
+        "startDate": start.strftime("%Y-%m-%d"),
+        "endDate":   end.strftime("%Y-%m-%d"),
+        "configuration": {
+            "adProduct":    "SPONSORED_PRODUCTS",
+            "groupBy":      ["campaign"],
+            "columns":      ["campaignId", "cost", "impressions", "clicks",
+                             "purchases7d", "sales7d"],
+            "reportTypeId": "spCampaigns",
+            "timeUnit":     "SUMMARY",
+            "format":       "GZIP_JSON",
+            "segment":      "placement",
+        },
+    }
+    rr = requests.post(f"{EU_API}/reporting/reports", headers=headers, json=body, timeout=30)
+    rr_json = rr.json()
+    rid = rr_json.get("reportId")
+    if not rid and rr.status_code == 425:
+        detail = rr_json.get("detail", "")
+        rid = detail.split(":")[-1].strip() if ":" in detail else None
+    if not rid:
+        print(f"PlacementSpend report failed [{profile_id}]: {rr.status_code} {rr.text[:200]}", flush=True)
+        return {}
+
+    # Placement label normaliser — Amazon returns several naming variants
+    def _pl_key(raw):
+        r = (raw or "").upper()
+        if "TOP"     in r: return "top"
+        if "REST"    in r: return "rest"
+        if "PRODUCT" in r or "DETAIL" in r: return "product"
+        return "other"
+
+    duplicate = rr.status_code == 425
+    for attempt in range(120):          # max ~10 min
+        if not (attempt == 0 and duplicate):
+            time.sleep(5)
+        rs = requests.get(f"{EU_API}/reporting/reports/{rid}", headers=headers, timeout=30).json()
+        if rs.get("status") == "COMPLETED":
+            raw_bytes = requests.get(rs["url"]).content
+            data = json.loads(gzip.decompress(raw_bytes))
+            agg = {}
+            for row in data:
+                key = _pl_key(row.get("placement", ""))
+                if key == "other":
+                    continue
+                if key not in agg:
+                    agg[key] = {"spend": 0, "clicks": 0, "impressions": 0,
+                                "orders": 0, "sales": 0}
+                agg[key]["spend"]       += float(row.get("cost", 0))
+                agg[key]["clicks"]      += int(row.get("clicks", 0))
+                agg[key]["impressions"] += int(row.get("impressions", 0))
+                agg[key]["orders"]      += int(row.get("purchases7d", 0))
+                agg[key]["sales"]       += float(row.get("sales7d", 0))
+            return agg
+        elif rs.get("status") == "FAILED":
+            print(f"PlacementSpend report FAILED [{profile_id}]: {rs}", flush=True)
+            return {}
+    print(f"PlacementSpend report timed out [{profile_id}]", flush=True)
+    return {}
+
+
 def _campaign_metrics_from_cache():
     """Aggregate spend/clicks/impressions/orders/sales per (profile, campaignId) from cache."""
     cached = load_cache() or {}
@@ -1166,12 +1239,36 @@ def api_placements():
         c["acos30d"]        = round(sp / sa * 100, 1) if sa > 0 else None
         c["roas30d"]        = round(sa / sp, 2)    if sp > 0 else None
 
-    # Account-level summaries
+    # Account-level summaries + placement spend (parallel fetch)
     acct_summary = _account_summary_from_cache()
-    account_summaries = [
-        {"profile": pid, "label": label, **acct_summary.get(pid, {})}
-        for pid, label in PROFILES.items()
-    ]
+    pl_spend = {}
+    with __import__("concurrent.futures").ThreadPoolExecutor(max_workers=2) as ex:
+        futs = {pid: ex.submit(_fetch_placement_spend_for_profile, token, pid)
+                for pid in PROFILES}
+        for pid, fut in futs.items():
+            try:
+                pl_spend[pid] = fut.result()
+            except Exception as e:
+                print(f"PlacementSpend error [{pid}]: {e}", flush=True)
+                pl_spend[pid] = {}
+
+    account_summaries = []
+    for pid, label in PROFILES.items():
+        entry = {"profile": pid, "label": label, **acct_summary.get(pid, {})}
+        ps = pl_spend.get(pid, {})
+        total_pl_spend = sum(v.get("spend", 0) for v in ps.values()) or 1  # avoid /0
+        entry["placementSpend"] = {
+            k: {
+                "spend":   round(v.get("spend", 0), 0),
+                "clicks":  v.get("clicks", 0),
+                "orders":  v.get("orders", 0),
+                "acos":    round(v["spend"] / v["sales"] * 100, 1)
+                           if v.get("sales", 0) > 0 else None,
+                "sharePct": round(v.get("spend", 0) / total_pl_spend * 100, 1),
+            }
+            for k, v in ps.items()
+        }
+        account_summaries.append(entry)
 
     return jsonify({"campaigns": all_camps, "undoLog": _placement_undo_log[-20:],
                     "accountSummaries": account_summaries})
@@ -2393,10 +2490,35 @@ function renderAccountSummary(summaries) {
   const el = document.getElementById('pl-account-summary');
   if (!summaries.length) { el.style.display = 'none'; return; }
   el.style.display = 'block';
-  el.innerHTML = summaries.map(s => `
+
+  const plLabel = { top: 'Top of Search', rest: 'Rest of Search', product: 'Product Pages' };
+  const plColor = { top: '#2563eb', rest: '#7c3aed', product: '#d97706' };
+
+  el.innerHTML = summaries.map(s => {
+    const ps = s.placementSpend || {};
+    const hasPlacement = Object.keys(ps).length > 0;
+
+    const plRows = ['top','rest','product'].map(k => {
+      const p = ps[k];
+      if (!p) return '';
+      return `
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #f1f5f9">
+          <div style="width:120px;font-size:12px;font-weight:700;color:${plColor[k]}">${plLabel[k]}</div>
+          <div style="flex:1;background:#f1f5f9;border-radius:4px;height:8px;overflow:hidden">
+            <div style="width:${p.sharePct}%;background:${plColor[k]};height:100%;border-radius:4px"></div>
+          </div>
+          <div style="width:60px;font-size:12px;font-weight:800;text-align:right">${fmt(p.spend)}</div>
+          <div style="width:40px;font-size:11px;color:#64748b;text-align:right">${p.sharePct}%</div>
+          <div style="width:55px;font-size:11px;color:${acosColor(p.acos)};font-weight:700;text-align:right">${fmtp(p.acos)} ACoS</div>
+        </div>`;
+    }).join('');
+
+    return `
     <div style="background:#fff;border:1px solid var(--b);border-radius:10px;padding:14px 18px;margin-bottom:10px">
-      <div style="font-size:11px;font-weight:800;color:#64748b;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px">${s.label} — 30-day overview</div>
-      <div style="display:flex;gap:0;flex-wrap:wrap">
+      <div style="font-size:11px;font-weight:800;color:#64748b;letter-spacing:1px;text-transform:uppercase;margin-bottom:12px">${s.label} — 30-day overview</div>
+
+      <!-- KPI row -->
+      <div style="display:flex;gap:0;flex-wrap:wrap;margin-bottom:${hasPlacement?'16px':'0'}">
         ${[
           ['Spend',       fmt(s.spend)],
           ['Clicks',      s.clicks ? s.clicks.toLocaleString() : '—'],
@@ -2405,13 +2527,21 @@ function renderAccountSummary(summaries) {
           ['CPC',         fmt(s.cpc)],
           ['ACoS',        fmtp(s.acos)],
           ['ROAS',        fmtx(s.roas)],
-        ].map(([lbl, val], i) => `
-          <div style="padding:6px 18px;border-right:1px solid var(--b);${i===6?'border-right:none':''}">
-            <div style="font-size:18px;font-weight:800;color:${lbl==='ACoS'?acosColor(s.acos):lbl==='ROAS'?'#2563eb':'#0f172a'}">${val}</div>
+        ].map(([lbl, val], i, arr) => `
+          <div style="padding:6px 16px;border-right:1px solid var(--b);${i===arr.length-1?'border-right:none':''}">
+            <div style="font-size:17px;font-weight:800;color:${lbl==='ACoS'?acosColor(s.acos):lbl==='ROAS'?'#2563eb':'#0f172a'}">${val}</div>
             <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px">${lbl}</div>
           </div>`).join('')}
       </div>
-    </div>`).join('');
+
+      <!-- Placement spend breakdown -->
+      ${hasPlacement ? `
+        <div style="border-top:1px solid #f1f5f9;padding-top:12px">
+          <div style="font-size:11px;font-weight:700;color:#94a3b8;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px">Spend by Placement</div>
+          ${plRows}
+        </div>` : ''}
+    </div>`;
+  }).join('');
 }
 
 function renderPlTable() {
