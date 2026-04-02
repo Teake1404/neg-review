@@ -298,6 +298,7 @@ def fetch_all_terms(token, profile_id, debug_log=None):
                     "sales":        round(sales, 0),
                     "orders":       orders,
                     "clicks":       clicks,
+                    "impressions":  int(row.get("impressions", 0)),
                     "acos":         round(acos * 100, 1) if acos else None,
                     "cpc":          round(spend / clicks, 2) if clicks > 0 else None,
                     "profile":      profile_id,
@@ -1062,6 +1063,43 @@ _PLACEMENT_LABELS = {
 }
 
 
+def _campaign_metrics_from_cache():
+    """Aggregate spend/clicks/impressions/orders/sales per (profile, campaignId) from cache."""
+    cached = load_cache() or {}
+    agg = {}
+    for t in cached.get("terms", []):
+        key = (str(t.get("profile", "")), str(t.get("campaignId", "")))
+        if key not in agg:
+            agg[key] = {"spend": 0, "clicks": 0, "impressions": 0, "orders": 0, "sales": 0}
+        agg[key]["spend"]       += float(t.get("spend", 0) or 0)
+        agg[key]["clicks"]      += int(t.get("clicks", 0) or 0)
+        agg[key]["impressions"] += int(t.get("impressions", 0) or 0)
+        agg[key]["orders"]      += int(t.get("orders", 0) or 0)
+        agg[key]["sales"]       += float(t.get("sales", 0) or 0)
+    return agg
+
+
+def _account_summary_from_cache():
+    """Per-profile totals: spend, clicks, impressions, orders, sales."""
+    cached = load_cache() or {}
+    summary = {}
+    for t in cached.get("terms", []):
+        pid = str(t.get("profile", ""))
+        if pid not in summary:
+            summary[pid] = {"spend": 0, "clicks": 0, "impressions": 0, "orders": 0, "sales": 0}
+        summary[pid]["spend"]       += float(t.get("spend", 0) or 0)
+        summary[pid]["clicks"]      += int(t.get("clicks", 0) or 0)
+        summary[pid]["impressions"] += int(t.get("impressions", 0) or 0)
+        summary[pid]["orders"]      += int(t.get("orders", 0) or 0)
+        summary[pid]["sales"]       += float(t.get("sales", 0) or 0)
+    # compute derived metrics
+    for pid, s in summary.items():
+        s["acos"] = round(s["spend"] / s["sales"] * 100, 1) if s["sales"] > 0 else None
+        s["roas"] = round(s["sales"] / s["spend"], 2)       if s["spend"] > 0 else None
+        s["cpc"]  = round(s["spend"] / s["clicks"], 2)      if s["clicks"] > 0 else None
+    return summary
+
+
 def _fetch_placements_for_profile(token, profile_id, label):
     headers = {
         "Amazon-Advertising-API-ClientId": CLIENT_ID,
@@ -1072,8 +1110,7 @@ def _fetch_placements_for_profile(token, profile_id, label):
     }
     campaigns, nt = [], None
     while True:
-        body = {"stateFilter": {"include": ["ENABLED", "PAUSED"]},
-                "include": ["bidding"]}
+        body = {"stateFilter": {"include": ["ENABLED", "PAUSED"]}}
         if nt:
             body["nextToken"] = nt
         r = requests.post(f"{EU_API}/sp/campaigns/list", headers=headers, json=body, timeout=30)
@@ -1107,11 +1144,37 @@ def api_placements():
         token = get_token()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
     all_camps = []
     for pid, label in PROFILES.items():
         all_camps.extend(_fetch_placements_for_profile(token, pid, label))
     all_camps.sort(key=lambda c: c["campaignName"])
-    return jsonify({"campaigns": all_camps, "undoLog": _placement_undo_log[-20:]})
+
+    # Merge 30-day performance metrics from cache
+    metrics = _campaign_metrics_from_cache()
+    for c in all_camps:
+        key = (c["profile"], c["campaignId"])
+        m = metrics.get(key, {})
+        sp = m.get("spend", 0)
+        cl = m.get("clicks", 0)
+        sa = m.get("sales", 0)
+        c["spend30d"]       = round(sp, 0)
+        c["clicks30d"]      = cl
+        c["impressions30d"] = m.get("impressions", 0)
+        c["orders30d"]      = m.get("orders", 0)
+        c["cpc30d"]         = round(sp / cl, 2)    if cl > 0 else None
+        c["acos30d"]        = round(sp / sa * 100, 1) if sa > 0 else None
+        c["roas30d"]        = round(sa / sp, 2)    if sp > 0 else None
+
+    # Account-level summaries
+    acct_summary = _account_summary_from_cache()
+    account_summaries = [
+        {"profile": pid, "label": label, **acct_summary.get(pid, {})}
+        for pid, label in PROFILES.items()
+    ]
+
+    return jsonify({"campaigns": all_camps, "undoLog": _placement_undo_log[-20:],
+                    "accountSummaries": account_summaries})
 
 
 @app.route("/api/placements/update", methods=["POST"])
@@ -1490,6 +1553,9 @@ tr.brand-row td{background:#fefce8!important}
              style="padding:6px 10px;border:1px solid var(--b);border-radius:6px;font-size:13px;width:200px">
     </div>
   </div>
+
+  <!-- Account-level summary -->
+  <div id="pl-account-summary" style="display:none;margin-bottom:14px"></div>
 
   <div id="pl-table-container">
     <div class="loading"><span class="spinner"></span>Loading placements…</div>
@@ -2298,21 +2364,54 @@ async function createSelfTargets() {
 }
 
 // ── PLACEMENTS TAB ──────────────────────────────────────────────────────────
-let plCampaigns = [];   // full list from server
-let plFiltered  = [];   // after search filter
+let plCampaigns = [];
+let plFiltered  = [];
+
+const fmt  = n => n == null ? '—' : '₹' + Number(n).toLocaleString('en-IN', {maximumFractionDigits:0});
+const fmtp = n => n == null ? '—' : n + '%';
+const fmtx = n => n == null ? '—' : n + 'x';
+const acosColor = v => v == null ? '#94a3b8' : v > 40 ? '#dc2626' : v > 25 ? '#d97706' : '#16a34a';
 
 async function loadPlacements() {
   document.getElementById('pl-table-container').innerHTML =
     '<div class="loading"><span class="spinner"></span>Loading placements…</div>';
+  document.getElementById('pl-account-summary').style.display = 'none';
   try {
     const d = await fetch('/api/placements').then(r => r.json());
+    if (d.error) throw new Error(d.error);
     plCampaigns = (d.campaigns || []).map(c => ({...c, checked: false}));
+    renderAccountSummary(d.accountSummaries || []);
     renderPlTable();
     renderUndoLog(d.undoLog || []);
   } catch(e) {
     document.getElementById('pl-table-container').innerHTML =
-      `<p style="color:red;padding:16px">Error: ${e.message}</p>`;
+      `<p style="color:red;padding:16px">Error loading placements: ${e.message}</p>`;
   }
+}
+
+function renderAccountSummary(summaries) {
+  const el = document.getElementById('pl-account-summary');
+  if (!summaries.length) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  el.innerHTML = summaries.map(s => `
+    <div style="background:#fff;border:1px solid var(--b);border-radius:10px;padding:14px 18px;margin-bottom:10px">
+      <div style="font-size:11px;font-weight:800;color:#64748b;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px">${s.label} — 30-day overview</div>
+      <div style="display:flex;gap:0;flex-wrap:wrap">
+        ${[
+          ['Spend',       fmt(s.spend)],
+          ['Clicks',      s.clicks ? s.clicks.toLocaleString() : '—'],
+          ['Impressions', s.impressions ? s.impressions.toLocaleString() : '—'],
+          ['Orders',      s.orders ?? '—'],
+          ['CPC',         fmt(s.cpc)],
+          ['ACoS',        fmtp(s.acos)],
+          ['ROAS',        fmtx(s.roas)],
+        ].map(([lbl, val], i) => `
+          <div style="padding:6px 18px;border-right:1px solid var(--b);${i===6?'border-right:none':''}">
+            <div style="font-size:18px;font-weight:800;color:${lbl==='ACoS'?acosColor(s.acos):lbl==='ROAS'?'#2563eb':'#0f172a'}">${val}</div>
+            <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px">${lbl}</div>
+          </div>`).join('')}
+      </div>
+    </div>`).join('');
 }
 
 function renderPlTable() {
@@ -2329,37 +2428,55 @@ function renderPlTable() {
   }
 
   const stratLabel = s => s
-    ? s.replace('DYNAMIC_BIDS_','').replace(/_/g,' ').toLowerCase()
-        .replace(/\b\w/g,c=>c.toUpperCase())
+    ? s.replace('DYNAMIC_BIDS_','').replace(/_/g,' ').toLowerCase().replace(/\b\w/g,x=>x.toUpperCase())
     : '—';
 
-  let rows = plFiltered.map((c,i) => `
-    <tr style="background:${i%2===0?'#fff':'#f9fafb'}">
-      <td style="padding:7px 10px"><input type="checkbox" ${c.checked?'checked':''} onchange="plToggle(${plCampaigns.indexOf(c)},this.checked)"></td>
-      <td style="padding:7px 10px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${c.campaignName}">${c.campaignName}</td>
-      <td style="padding:7px 10px;font-size:11px;color:#64748b">${c.profileLabel}</td>
-      <td style="padding:7px 10px;font-size:11px">${stratLabel(c.strategy)}</td>
-      <td style="padding:7px 10px;text-align:center;font-weight:700;color:${c.top>0?'#2563eb':'#94a3b8'}">${c.top}%</td>
-      <td style="padding:7px 10px;text-align:center;font-weight:700;color:${c.rest>0?'#2563eb':'#94a3b8'}">${c.rest}%</td>
-      <td style="padding:7px 10px;text-align:center;font-weight:700;color:${c.product>0?'#2563eb':'#94a3b8'}">${c.product}%</td>
-    </tr>`).join('');
+  const pctCell = (v, field) => {
+    const color = v > 0 ? '#2563eb' : '#94a3b8';
+    return `<td style="padding:7px 8px;text-align:center;font-weight:700;color:${color}">${v}%</td>`;
+  };
+
+  let rows = plFiltered.map((c,i) => {
+    const bg = i%2===0?'#fff':'#f9fafb';
+    return `<tr style="background:${bg}">
+      <td style="padding:7px 8px"><input type="checkbox" ${c.checked?'checked':''} onchange="plToggle(${plCampaigns.indexOf(c)},this.checked)"></td>
+      <td style="padding:7px 8px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600" title="${c.campaignName}">${c.campaignName}</td>
+      <td style="padding:7px 8px;font-size:11px;color:#64748b">${c.profileLabel}</td>
+      <td style="padding:7px 8px;font-size:11px">${stratLabel(c.strategy)}</td>
+      <td style="padding:7px 8px;text-align:right">${fmt(c.spend30d)}</td>
+      <td style="padding:7px 8px;text-align:right">${c.impressions30d ? c.impressions30d.toLocaleString() : '—'}</td>
+      <td style="padding:7px 8px;text-align:right">${c.clicks30d ? c.clicks30d.toLocaleString() : '—'}</td>
+      <td style="padding:7px 8px;text-align:right">${fmt(c.cpc30d)}</td>
+      <td style="padding:7px 8px;text-align:right;font-weight:700;color:${acosColor(c.acos30d)}">${fmtp(c.acos30d)}</td>
+      <td style="padding:7px 8px;text-align:right;color:#2563eb;font-weight:700">${fmtx(c.roas30d)}</td>
+      ${pctCell(c.top,'top')}${pctCell(c.rest,'rest')}${pctCell(c.product,'product')}
+    </tr>`;
+  }).join('');
 
   document.getElementById('pl-table-container').innerHTML = `
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:12px;min-width:900px">
       <thead>
         <tr style="background:#0f172a;color:#fff">
-          <th style="padding:8px 10px;width:32px"><input type="checkbox" onchange="plToggleAll(this.checked)" id="pl-check-all"></th>
-          <th style="padding:8px 10px;text-align:left">Campaign</th>
-          <th style="padding:8px 10px;text-align:left">Account</th>
-          <th style="padding:8px 10px;text-align:left">Bid Strategy</th>
-          <th style="padding:8px 10px;text-align:center">Top of Search %</th>
-          <th style="padding:8px 10px;text-align:center">Rest of Search %</th>
-          <th style="padding:8px 10px;text-align:center">Product Pages %</th>
+          <th style="padding:8px 8px;width:28px"><input type="checkbox" onchange="plToggleAll(this.checked)" id="pl-check-all"></th>
+          <th style="padding:8px 8px;text-align:left">Campaign</th>
+          <th style="padding:8px 8px;text-align:left">Account</th>
+          <th style="padding:8px 8px;text-align:left">Strategy</th>
+          <th style="padding:8px 8px;text-align:right">Spend (30d)</th>
+          <th style="padding:8px 8px;text-align:right">Impr.</th>
+          <th style="padding:8px 8px;text-align:right">Clicks</th>
+          <th style="padding:8px 8px;text-align:right">CPC</th>
+          <th style="padding:8px 8px;text-align:right">ACoS</th>
+          <th style="padding:8px 8px;text-align:right">ROAS</th>
+          <th style="padding:8px 8px;text-align:center">Top %</th>
+          <th style="padding:8px 8px;text-align:center">Rest %</th>
+          <th style="padding:8px 8px;text-align:center">Pages %</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
     </table>
-    <p style="font-size:11px;color:#94a3b8;margin-top:8px">${plFiltered.length} campaigns · leave a field blank to keep current value</p>`;
+    </div>
+    <p style="font-size:11px;color:#94a3b8;margin-top:8px">${plFiltered.length} campaigns · 30-day data from cache · leave % field blank to keep current value</p>`;
   updatePlApplyBtn();
 }
 
